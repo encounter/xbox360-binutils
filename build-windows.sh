@@ -1,7 +1,7 @@
 #!/bin/bash -ex
 PREFIX="$(pwd)/build"
 mkdir source
-wget -qO- https://ftpmirror.gnu.org/gnu/binutils/binutils-2.45.1.tar.xz | tar -xJ -C source --strip-components=1
+wget -qO- https://mirrors.ibiblio.org/gnu/binutils/binutils-2.45.1.tar.xz | tar -xJ -C source --strip-components=1
 cd source
 for patch in ../*.patch; do
   patch -N -p1 -i "$patch"

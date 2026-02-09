@@ -14,7 +14,7 @@ ENV PATH="/zig:$PATH"
 
 # Download binutils
 ARG BINUTILS_VERSION=2.45.1
-RUN wget -q https://ftpmirror.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.xz
+RUN wget -q https://mirrors.ibiblio.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.xz
 
 # Build host binutils
 ARG GNU_TRIPLE
