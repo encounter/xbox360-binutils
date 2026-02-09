@@ -516,7 +516,7 @@ index 5879a04785d..efa8d7a9a01 100644
      riscv_elf32_vec)		 tb="$tb elf32-riscv.lo elfxx-riscv.lo elf-ifunc.lo elf32.lo $elf" ;;
      riscv_elf64_vec)		 tb="$tb elf64-riscv.lo elf64.lo elfxx-riscv.lo elf-ifunc.lo elf32.lo $elf"; target_size=64 ;;
 diff --git a/bfd/cpu-powerpc.c b/bfd/cpu-powerpc.c
-index ffb0ec4a4da..2737e927d63 100644
+index ffb0ec4a4da..d4b2cd2ef91 100644
 --- a/bfd/cpu-powerpc.c
 +++ b/bfd/cpu-powerpc.c
 @@ -154,5 +154,6 @@ const bfd_arch_info_type bfd_powerpc_archs[] =
@@ -525,7 +525,7 @@ index ffb0ec4a4da..2737e927d63 100644
    N (64, bfd_mach_ppc_e5500, "powerpc:e5500", false, bfd_powerpc_archs + 21),
 -  N (64, bfd_mach_ppc_e6500, "powerpc:e6500", false, NULL)
 +  N (64, bfd_mach_ppc_e6500, "powerpc:e6500", false, bfd_powerpc_archs + 22),
-+  N (32, bfd_mach_ppc_xenon, "powerpc:xenon", false, NULL)
++  N (64, bfd_mach_ppc_xenon, "powerpc:xenon", false, NULL)
  };
 diff --git a/bfd/doc/xenon-ppc-coff.txt b/bfd/doc/xenon-ppc-coff.txt
 new file mode 100644
@@ -934,14 +934,14 @@ index 2e27f6ba93c..70208193b1e 100644
  #define PPC_OP(i) (((i) >> 26) & 0x3f)
  
 diff --git a/opcodes/ppc-dis.c b/opcodes/ppc-dis.c
-index 3e210341228..94208e045c4 100644
+index 3e210341228..d4008a0480c 100644
 --- a/opcodes/ppc-dis.c
 +++ b/opcodes/ppc-dis.c
 @@ -293,6 +293,8 @@ struct ppc_mopt ppc_opts[] = {
  		| PPC_OPCODE_PMR | PPC_OPCODE_CACHELCK | PPC_OPCODE_RFMCI
  		| PPC_OPCODE_EFS2 | PPC_OPCODE_SPE2),
      PPC_OPCODE_VLE },
-+  { "vmx128",  PPC_OPCODE_PPC | PPC_OPCODE_ALTIVEC,
++  { "vmx128",  PPC_OPCODE_PPC | PPC_OPCODE_64 | PPC_OPCODE_ALTIVEC,
 +    PPC_OPCODE_VMX128 },
    { "vsx",     PPC_OPCODE_PPC,
      PPC_OPCODE_VSX },
