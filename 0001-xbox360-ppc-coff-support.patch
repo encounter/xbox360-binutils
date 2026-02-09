@@ -1,0 +1,1563 @@
+From 5007a43171054db58433659d3deb9445f1e5ac65 Mon Sep 17 00:00:00 2001
+From: Luke Street <luke@street.dev>
+Date: Sun, 8 Feb 2026 17:22:04 -0700
+Subject: [PATCH 1/5] Add Xbox 360 big-endian PowerPC COFF support
+ (pe-powerpcbe)
+
+Add objdump and GAS support for Xbox 360 (Xenon) object files, which
+use PE/COFF format with IMAGE_FILE_MACHINE_POWERPCBE (0x01F2).  The
+format uses little-endian structural headers with big-endian PowerPC
+code and data sections.
+
+BFD changes:
+- New include/coff/powerpc.h with PPCBEMAGIC and IMAGE_REL_PPC_*
+  relocation type definitions
+- New bfd/coff-ppc-be.c backend with relocation howtos for all 22
+  PowerPC COFF relocation types
+- New bfd/pe-ppc-be.c PE wrapper defining powerpc_pe_be_vec target
+- Register PPCBEMAGIC in coffcode.h for arch/magic detection
+- Register target in targets.c, config.bfd, configure.ac, Makefile
+
+Opcodes changes:
+- Add PPC_OPCODE_VMX128 flag for Xbox 360 VMX128 extension
+- Add 89 VMX128 instructions across primary opcodes 4, 5, and 6
+- Add VD128/VA128/VB128 operand types with insert/extract functions
+  for 7-bit scattered register encoding (v0-v127)
+- Add vmx128 CPU option to ppc_opts[] and ppc-dis.c
+
+GAS changes:
+- Add -mvmx128 command-line option and help text
+- Add powerpc-xbox360-pe target to gas/configure.tgt
+- Support .machine "vmx128" directive
+
+Tested against Xbox 360 object files with 100% instruction decode rate
+and verified assembly round-trip against powerpc-rs reference encodings.
+---
+ bfd/Makefile.am              |   2 +
+ bfd/Makefile.in              |   2 +
+ bfd/coff-ppc-be.c            | 367 +++++++++++++++++++++++++++++++++++
+ bfd/coffcode.h               |  17 ++
+ bfd/config.bfd               |   4 +
+ bfd/configure                |   1 +
+ bfd/configure.ac             |   1 +
+ bfd/doc/xbox360-ppc-coff.txt |  84 ++++++++
+ bfd/pe-ppc-be.c              |  68 +++++++
+ bfd/targets.c                |   2 +
+ gas/config/tc-ppc.c          |   2 +
+ gas/configure.tgt            |   1 +
+ include/coff/pe.h            |   1 +
+ include/coff/powerpc.h       |  95 +++++++++
+ include/opcode/ppc.h         |   3 +
+ ld/configure.tgt             |   3 +
+ opcodes/ppc-dis.c            |   2 +
+ opcodes/ppc-opc.c            | 234 ++++++++++++++++++++++
+ 18 files changed, 889 insertions(+)
+ create mode 100644 bfd/coff-ppc-be.c
+ create mode 100644 bfd/doc/xbox360-ppc-coff.txt
+ create mode 100644 bfd/pe-ppc-be.c
+ create mode 100644 include/coff/powerpc.h
+
+diff --git a/bfd/Makefile.am b/bfd/Makefile.am
+index 4987ac9cccc..312e7746f77 100644
+--- a/bfd/Makefile.am
++++ b/bfd/Makefile.am
+@@ -373,6 +373,7 @@ BFD32_BACKENDS = \
+ 	pe-arm.lo \
+ 	pe-i386.lo \
+ 	pe-mcore.lo \
++	pe-ppc-be.lo \
+ 	pe-sh.lo \
+ 	pef.lo \
+ 	pei-arm-wince.lo \
+@@ -507,6 +508,7 @@ BFD32_BACKENDS_CFILES = \
+ 	pe-arm.c \
+ 	pe-i386.c \
+ 	pe-mcore.c \
++	pe-ppc-be.c \
+ 	pe-sh.c \
+ 	pef.c \
+ 	pei-arm-wince.c \
+diff --git a/bfd/Makefile.in b/bfd/Makefile.in
+index 8a670ad1d05..9f8c5387881 100644
+--- a/bfd/Makefile.in
++++ b/bfd/Makefile.in
+@@ -839,6 +839,7 @@ BFD32_BACKENDS = \
+ 	pe-arm.lo \
+ 	pe-i386.lo \
+ 	pe-mcore.lo \
++	pe-ppc-be.lo \
+ 	pe-sh.lo \
+ 	pef.lo \
+ 	pei-arm-wince.lo \
+@@ -973,6 +974,7 @@ BFD32_BACKENDS_CFILES = \
+ 	pe-arm.c \
+ 	pe-i386.c \
+ 	pe-mcore.c \
++	pe-ppc-be.c \
+ 	pe-sh.c \
+ 	pef.c \
+ 	pei-arm-wince.c \
+diff --git a/bfd/coff-ppc-be.c b/bfd/coff-ppc-be.c
+new file mode 100644
+index 00000000000..81e0201b9bd
+--- /dev/null
++++ b/bfd/coff-ppc-be.c
+@@ -0,0 +1,367 @@
++/* BFD back-end for big-endian PowerPC COFF files (Xbox 360).
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of BFD, the Binary File Descriptor library.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++   MA 02110-1301, USA.  */
++
++#ifndef COFF_WITH_PE
++#error non-PE COFF unsupported
++#endif
++
++#include "sysdep.h"
++#include "bfd.h"
++#include "libbfd.h"
++#include "coff/powerpc.h"
++#include "coff/internal.h"
++#include "coff/pe.h"
++#include "libcoff.h"
++#include "libiberty.h"
++
++#define coff_ppc_be_NULL NULL
++#undef HOWTO_INSTALL_ADDEND
++#define HOWTO_INSTALL_ADDEND 1
++#define HOW(type, right, size, bits, pcrel, left, ovf, func, mask) \
++  HOWTO (type, right, size, bits, pcrel, left, complain_overflow_##ovf, \
++	 coff_ppc_be_##func, #type, true, mask, mask, false)
++
++static const reloc_howto_type ppc_reloc_howto_abs
++= HOW (IMAGE_REL_PPC_ABSOLUTE,
++       0, 0, 0, false, 0, dont, NULL, 0);
++
++static const reloc_howto_type ppc_reloc_howto_64
++= HOW (IMAGE_REL_PPC_ADDR64,
++       0, 8, 64, false, 0, dont, NULL, UINT64_C (-1));
++
++static const reloc_howto_type ppc_reloc_howto_32
++= HOW (IMAGE_REL_PPC_ADDR32,
++       0, 4, 32, false, 0, signed, NULL, 0xffffffff);
++
++static const reloc_howto_type ppc_reloc_howto_addr24
++= HOW (IMAGE_REL_PPC_ADDR24,
++       0, 4, 26, false, 0, signed, NULL, 0x3fffffc);
++
++static const reloc_howto_type ppc_reloc_howto_16
++= HOW (IMAGE_REL_PPC_ADDR16,
++       0, 2, 16, false, 0, signed, NULL, 0xffff);
++
++static const reloc_howto_type ppc_reloc_howto_addr14
++= HOW (IMAGE_REL_PPC_ADDR14,
++       0, 4, 16, false, 0, signed, NULL, 0xfffc);
++
++static const reloc_howto_type ppc_reloc_howto_rel24
++= HOW (IMAGE_REL_PPC_REL24,
++       0, 4, 26, true, 0, signed, NULL, 0x3fffffc);
++
++static const reloc_howto_type ppc_reloc_howto_rel14
++= HOW (IMAGE_REL_PPC_REL14,
++       0, 4, 16, true, 0, signed, NULL, 0xfffc);
++
++static const reloc_howto_type ppc_reloc_howto_tocrel16
++= HOW (IMAGE_REL_PPC_TOCREL16,
++       0, 2, 16, false, 0, signed, NULL, 0xffff);
++
++static const reloc_howto_type ppc_reloc_howto_tocrel14
++= HOW (IMAGE_REL_PPC_TOCREL14,
++       0, 4, 16, false, 0, signed, NULL, 0xfffc);
++
++static const reloc_howto_type ppc_reloc_howto_32nb
++= HOW (IMAGE_REL_PPC_ADDR32NB,
++       0, 4, 32, false, 0, signed, NULL, 0xffffffff);
++
++static const reloc_howto_type ppc_reloc_howto_secrel
++= HOW (IMAGE_REL_PPC_SECREL,
++       0, 4, 32, false, 0, dont, NULL, 0xffffffff);
++
++static const reloc_howto_type ppc_reloc_howto_section
++= HOW (IMAGE_REL_PPC_SECTION,
++       0, 2, 16, false, 0, dont, NULL, 0xffff);
++
++static const reloc_howto_type ppc_reloc_howto_secrel16
++= HOW (IMAGE_REL_PPC_SECREL16,
++       0, 2, 16, false, 0, dont, NULL, 0xffff);
++
++static const reloc_howto_type ppc_reloc_howto_refhi
++= HOW (IMAGE_REL_PPC_REFHI,
++       16, 4, 16, false, 0, dont, NULL, 0xffff);
++
++static const reloc_howto_type ppc_reloc_howto_reflo
++= HOW (IMAGE_REL_PPC_REFLO,
++       0, 4, 16, false, 0, dont, NULL, 0xffff);
++
++static const reloc_howto_type ppc_reloc_howto_pair
++= HOW (IMAGE_REL_PPC_PAIR,
++       0, 4, 32, false, 0, dont, NULL, 0xffffffff);
++
++static const reloc_howto_type ppc_reloc_howto_secrello
++= HOW (IMAGE_REL_PPC_SECRELLO,
++       0, 2, 16, false, 0, dont, NULL, 0xffff);
++
++static const reloc_howto_type ppc_reloc_howto_secrelhi
++= HOW (IMAGE_REL_PPC_SECRELHI,
++       16, 4, 16, false, 0, dont, NULL, 0xffff);
++
++static const reloc_howto_type ppc_reloc_howto_gprel
++= HOW (IMAGE_REL_PPC_GPREL,
++       0, 2, 16, false, 0, signed, NULL, 0xffff);
++
++static const reloc_howto_type* const ppc_howto_table[] = {
++     &ppc_reloc_howto_abs,
++     &ppc_reloc_howto_64,
++     &ppc_reloc_howto_32,
++     &ppc_reloc_howto_addr24,
++     &ppc_reloc_howto_16,
++     &ppc_reloc_howto_addr14,
++     &ppc_reloc_howto_rel24,
++     &ppc_reloc_howto_rel14,
++     &ppc_reloc_howto_tocrel16,
++     &ppc_reloc_howto_tocrel14,
++     &ppc_reloc_howto_32nb,
++     &ppc_reloc_howto_secrel,
++     &ppc_reloc_howto_section,
++     NULL,  /* IFGLUE - not used for objdump */
++     NULL,  /* IMGLUE - not used for objdump */
++     &ppc_reloc_howto_secrel16,
++     &ppc_reloc_howto_refhi,
++     &ppc_reloc_howto_reflo,
++     &ppc_reloc_howto_pair,
++     &ppc_reloc_howto_secrello,
++     &ppc_reloc_howto_secrelhi,
++     &ppc_reloc_howto_gprel,
++};
++
++/* No adjustment to addends should be needed.  The actual relocation
++   addend is in the section contents.  */
++#define CALC_ADDEND(abfd, ptr, reloc, cache_ptr)		\
++  cache_ptr->addend = 0;
++
++#ifndef NUM_ELEM
++#define NUM_ELEM(a) ((sizeof (a)) / sizeof ((a)[0]))
++#endif
++
++#define NUM_RELOCS NUM_ELEM (ppc_howto_table)
++
++#define coff_bfd_reloc_type_lookup		coff_ppc_be_reloc_type_lookup
++#define coff_bfd_reloc_name_lookup		coff_ppc_be_reloc_name_lookup
++
++static reloc_howto_type *
++coff_ppc_be_reloc_type_lookup (bfd * abfd ATTRIBUTE_UNUSED,
++			       bfd_reloc_code_real_type code)
++{
++  switch (code)
++  {
++  case BFD_RELOC_64:
++    return &ppc_reloc_howto_64;
++  case BFD_RELOC_32:
++    return &ppc_reloc_howto_32;
++  case BFD_RELOC_PPC_B26:
++    return &ppc_reloc_howto_rel24;
++  case BFD_RELOC_PPC_BA26:
++    return &ppc_reloc_howto_addr24;
++  case BFD_RELOC_PPC_B16:
++    return &ppc_reloc_howto_rel14;
++  case BFD_RELOC_PPC_BA16:
++    return &ppc_reloc_howto_addr14;
++  case BFD_RELOC_16:
++    return &ppc_reloc_howto_16;
++  case BFD_RELOC_HI16:
++    return &ppc_reloc_howto_refhi;
++  case BFD_RELOC_LO16:
++    return &ppc_reloc_howto_reflo;
++  case BFD_RELOC_RVA:
++    return &ppc_reloc_howto_32nb;
++  case BFD_RELOC_32_SECREL:
++    return &ppc_reloc_howto_secrel;
++  case BFD_RELOC_16_SECIDX:
++    return &ppc_reloc_howto_section;
++  default:
++    BFD_FAIL ();
++    return NULL;
++  }
++
++  return NULL;
++}
++
++static reloc_howto_type *
++coff_ppc_be_reloc_name_lookup (bfd *abfd ATTRIBUTE_UNUSED,
++			       const char *r_name)
++{
++  unsigned int i;
++
++  for (i = 0; i < NUM_RELOCS; i++)
++    if (ppc_howto_table[i] != NULL
++	&& ppc_howto_table[i]->name != NULL
++	&& strcasecmp (ppc_howto_table[i]->name, r_name) == 0)
++      return ppc_howto_table[i];
++
++  return NULL;
++}
++
++#define COFF_DEFAULT_SECTION_ALIGNMENT_POWER  2
++#define COFF_PAGE_SIZE			      0x1000
++
++static reloc_howto_type *
++coff_ppc_be_rtype_lookup (unsigned int code)
++{
++  /* Mask off the flag bits to get the base type.  */
++  unsigned int base = code & IMAGE_REL_PPC_TYPEMASK;
++
++  if (base < NUM_RELOCS)
++    return ppc_howto_table[base];
++  return NULL;
++}
++
++#define RTYPE2HOWTO(cache_ptr, dst)					\
++  ((cache_ptr)->howto = coff_ppc_be_rtype_lookup((dst)->r_type))
++
++static reloc_howto_type *
++coff_ppc_be_rtype_to_howto (bfd *abfd ATTRIBUTE_UNUSED,
++			    asection *sec ATTRIBUTE_UNUSED,
++			    struct internal_reloc *rel,
++			    struct coff_link_hash_entry *h ATTRIBUTE_UNUSED,
++			    struct internal_syment *sym ATTRIBUTE_UNUSED,
++			    bfd_vma *addendp)
++{
++  reloc_howto_type *howto = coff_ppc_be_rtype_lookup (rel->r_type);
++
++  /* Cancel out code in _bfd_coff_generic_relocate_section.  */
++  *addendp = 0;
++
++  return howto;
++}
++
++#define coff_rtype_to_howto coff_ppc_be_rtype_to_howto
++
++#define SELECT_RELOC(x,howto) { (x).r_type = (howto)->type; }
++
++#ifndef bfd_pe_print_pdata
++#define bfd_pe_print_pdata      NULL
++#endif
++
++#ifdef COFF_WITH_PE
++/* Return TRUE if this relocation should
++   appear in the output .reloc section.  */
++
++static bool
++in_reloc_p (bfd * abfd ATTRIBUTE_UNUSED,
++            reloc_howto_type * howto)
++{
++  return !howto->pc_relative;
++}
++#endif
++
++#define coff_relocate_section _bfd_coff_generic_relocate_section
++
++#include "coffcode.h"
++
++/* Prevent assertion in md_apply_fix by forcing use_rela_p on for new
++   sections.  */
++static bool
++coff_ppc_be_new_section_hook (bfd *abfd, asection *section)
++{
++  if (!coff_new_section_hook (abfd, section))
++    return false;
++
++  section->use_rela_p = 1;
++
++  return true;
++}
++
++#define coff_ppc_be_close_and_cleanup coff_close_and_cleanup
++#define coff_ppc_be_bfd_free_cached_info coff_bfd_free_cached_info
++#define coff_ppc_be_get_section_contents coff_get_section_contents
++
++/* Target vectors.  */
++const bfd_target
++#ifdef TARGET_SYM
++  TARGET_SYM =
++#else
++# error "target symbol name not specified"
++#endif
++{
++#ifdef TARGET_NAME
++  TARGET_NAME,
++#else
++# error "target name not specified"
++#endif
++  bfd_target_coff_flavour,
++  BFD_ENDIAN_BIG,		/* Data byte order is big.  */
++  BFD_ENDIAN_LITTLE,		/* Header byte order is little.  */
++
++  (HAS_RELOC | EXEC_P		/* Object flags.  */
++   | HAS_LINENO | HAS_DEBUG
++   | HAS_SYMS | HAS_LOCALS | WP_TEXT | D_PAGED | BFD_COMPRESS | BFD_DECOMPRESS),
++
++  (SEC_HAS_CONTENTS | SEC_ALLOC | SEC_LOAD | SEC_RELOC /* Section flags.  */
++#if defined(COFF_WITH_PE)
++   | SEC_LINK_ONCE | SEC_LINK_DUPLICATES | SEC_READONLY | SEC_DEBUGGING
++#endif
++   | SEC_CODE | SEC_DATA | SEC_EXCLUDE ),
++
++#ifdef TARGET_UNDERSCORE
++  TARGET_UNDERSCORE,		/* Leading underscore.  */
++#else
++  0,				/* Leading underscore.  */
++#endif
++  '/',				/* Ar_pad_char.  */
++  15,				/* Ar_max_namelen.  */
++  0,				/* match priority.  */
++  TARGET_KEEP_UNUSED_SECTION_SYMBOLS, /* keep unused section symbols.  */
++  TARGET_MERGE_SECTIONS,
++
++  /* Data conversion functions.  Big-endian data.  */
++  bfd_getb64, bfd_getb_signed_64, bfd_putb64,
++  bfd_getb32, bfd_getb_signed_32, bfd_putb32,
++  bfd_getb16, bfd_getb_signed_16, bfd_putb16, /* Data.  */
++  /* Header conversion functions.  Little-endian headers.  */
++  bfd_getl64, bfd_getl_signed_64, bfd_putl64,
++  bfd_getl32, bfd_getl_signed_32, bfd_putl32,
++  bfd_getl16, bfd_getl_signed_16, bfd_putl16, /* Hdrs.  */
++
++  /* Note that we allow an object file to be treated as a core file as well.  */
++  {				/* bfd_check_format.  */
++    _bfd_dummy_target,
++    coff_object_p,
++    bfd_generic_archive_p,
++    coff_object_p
++  },
++  {				/* bfd_set_format.  */
++    _bfd_bool_bfd_false_error,
++    coff_mkobject,
++    _bfd_generic_mkarchive,
++    _bfd_bool_bfd_false_error
++  },
++  {				/* bfd_write_contents.  */
++    _bfd_bool_bfd_false_error,
++    coff_write_object_contents,
++    _bfd_write_archive_contents,
++    _bfd_bool_bfd_false_error
++  },
++
++  BFD_JUMP_TABLE_GENERIC (coff_ppc_be),
++  BFD_JUMP_TABLE_COPY (coff),
++  BFD_JUMP_TABLE_CORE (_bfd_nocore),
++  BFD_JUMP_TABLE_ARCHIVE (_bfd_archive_coff),
++  BFD_JUMP_TABLE_SYMBOLS (coff),
++  BFD_JUMP_TABLE_RELOCS (coff),
++  BFD_JUMP_TABLE_WRITE (coff),
++  BFD_JUMP_TABLE_LINK (coff),
++  BFD_JUMP_TABLE_DYNAMIC (_bfd_nodynamic),
++
++  NULL,
++
++  COFF_SWAP_TABLE
++};
+diff --git a/bfd/coffcode.h b/bfd/coffcode.h
+index b81195dd2ec..f2ecdb478d7 100644
+--- a/bfd/coffcode.h
++++ b/bfd/coffcode.h
+@@ -2220,6 +2220,12 @@ coff_set_arch_mach_hook (bfd *abfd, void * filehdr)
+       machine = internal_f->f_flags & F_AARCH64_ARCHITECTURE_MASK;
+       break;
+ #endif
++#ifdef PPCBEMAGIC
++    case PPCBEMAGIC:
++      arch = bfd_arch_powerpc;
++      machine = bfd_mach_ppc;
++      break;
++#endif
+ #ifdef LOONGARCH64MAGIC
+     case LOONGARCH64MAGIC:
+       arch = bfd_arch_loongarch;
+@@ -2797,6 +2803,12 @@ coff_set_flags (bfd * abfd,
+       return true;
+ #endif
+ 
++#ifdef PPCBEMAGIC
++    case bfd_arch_powerpc:
++      * magicp = PPCBEMAGIC;
++      return true;
++#endif
++
+ #ifdef LOONGARCH64MAGIC
+     case bfd_arch_loongarch:
+       * magicp = LOONGARCH64MAGIC;
+@@ -4114,6 +4126,11 @@ coff_write_object_contents (bfd * abfd)
+     internal_a.magic = MIPS_PE_MAGIC;
+ #endif
+ 
++#if defined(POWERPC) && defined(COFF_WITH_PE)
++#define __A_MAGIC_SET__
++    internal_a.magic = IMAGE_NT_OPTIONAL_HDR_MAGIC;
++#endif
++
+ #ifndef __A_MAGIC_SET__
+ #include "Your aouthdr magic number is not being set!"
+ #else
+diff --git a/bfd/config.bfd b/bfd/config.bfd
+index 4e5a838fe4e..2e59175aa94 100644
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -1160,6 +1160,10 @@ case "${targ}" in
+     targ_selvecs="rs6000_xcoff_vec powerpc_elf32_vec powerpc_elf32_le_vec powerpc_boot_vec"
+     targ64_selvecs="powerpc_elf64_vec powerpc_elf64_le_vec powerpc_elf64_fbsd_vec"
+     ;;
++  powerpc-*-pe* | powerpc-*-xbox360*)
++    targ_defvec=powerpc_pe_be_vec
++    targ_selvecs="powerpc_pe_be_vec powerpc_elf32_vec"
++    ;;
+   powerpc-*-*bsd* | powerpc-*-elf* | powerpc-*-sysv4* | powerpc-*-eabi* | \
+   powerpc-*-solaris2* | powerpc-*-linux-* | powerpc-*-rtems* | \
+   powerpc-*-chorus*)
+diff --git a/bfd/configure b/bfd/configure
+index 435b8e20718..e455511a1a4 100755
+--- a/bfd/configure
++++ b/bfd/configure
+@@ -15663,6 +15663,7 @@ do
+     powerpc_elf64_fbsd_vec)	 tb="$tb elf64-ppc.lo elf64-gen.lo elf64.lo $elf" target_size=64 ;;
+     powerpc_elf64_fbsd_le_vec)	 tb="$tb elf64-ppc.lo elf64-gen.lo elf64.lo $elf" target_size=64 ;;
+     powerpc_xcoff_vec)		 tb="$tb coff-rs6000.lo $xcoff" ;;
++    powerpc_pe_be_vec)		 tb="$tb pe-ppc-be.lo peigen.lo $coff" ;;
+     pru_elf32_vec)		 tb="$tb elf32-pru.lo elf32.lo $elf" ;;
+     riscv_elf32_vec)		 tb="$tb elf32-riscv.lo elfxx-riscv.lo elf-ifunc.lo elf32.lo $elf" ;;
+     riscv_elf64_vec)		 tb="$tb elf64-riscv.lo elf64.lo elfxx-riscv.lo elf-ifunc.lo elf32.lo $elf"; target_size=64 ;;
+diff --git a/bfd/configure.ac b/bfd/configure.ac
+index 5879a04785d..efa8d7a9a01 100644
+--- a/bfd/configure.ac
++++ b/bfd/configure.ac
+@@ -588,6 +588,7 @@ do
+     powerpc_elf64_fbsd_vec)	 tb="$tb elf64-ppc.lo elf64-gen.lo elf64.lo $elf" target_size=64 ;;
+     powerpc_elf64_fbsd_le_vec)	 tb="$tb elf64-ppc.lo elf64-gen.lo elf64.lo $elf" target_size=64 ;;
+     powerpc_xcoff_vec)		 tb="$tb coff-rs6000.lo $xcoff" ;;
++    powerpc_pe_be_vec)		 tb="$tb pe-ppc-be.lo peigen.lo $coff" ;;
+     pru_elf32_vec)		 tb="$tb elf32-pru.lo elf32.lo $elf" ;;
+     riscv_elf32_vec)		 tb="$tb elf32-riscv.lo elfxx-riscv.lo elf-ifunc.lo elf32.lo $elf" ;;
+     riscv_elf64_vec)		 tb="$tb elf64-riscv.lo elf64.lo elfxx-riscv.lo elf-ifunc.lo elf32.lo $elf"; target_size=64 ;;
+diff --git a/bfd/doc/xbox360-ppc-coff.txt b/bfd/doc/xbox360-ppc-coff.txt
+new file mode 100644
+index 00000000000..1c1b15ec275
+--- /dev/null
++++ b/bfd/doc/xbox360-ppc-coff.txt
+@@ -0,0 +1,84 @@
++Xbox 360 Big-Endian PowerPC COFF Support
++=========================================
++
++Target
++------
++  Triple:     powerpc-xbox360-pe
++  BFD name:   pe-powerpcbe
++  Machine:    IMAGE_FILE_MACHINE_POWERPCBE (0x01F2)
++  Format:     PE/COFF with little-endian headers, big-endian data
++  Arch:       bfd_arch_powerpc (powerpc:common)
++
++The Xbox 360 (Xenon) CPU is a big-endian PowerPC with AltiVec and the
++VMX128 extension.  Object files produced by the Xbox 360 MSVC toolchain
++use standard PE/COFF structure with little-endian structural headers and
++big-endian code/data sections.
++
++Configure and Build
++-------------------
++  mkdir build && cd build
++  ../configure --target=powerpc-xbox360-pe --enable-targets=all \
++               --disable-gdb --disable-gdbserver
++  make
++
++objdump Usage
++-------------
++  objdump -d -Mvmx128 file.obj      # disassemble with VMX128
++  objdump -d -Many file.obj         # all instruction sets
++  objdump -dr -Mvmx128 file.obj     # disassembly with inline relocations
++  objdump -x file.obj               # full headers, symbols, relocations
++
++Assembler (GAS) Usage
++---------------------
++  as -mppc -mvmx128 -o output.o input.s
++
++  The .machine directive also works:
++    .machine "vmx128"
++
++Disassembler Flags (-M)
++-----------------------
++  vmx128    Enable Xbox 360 VMX128 instructions (v0-v127)
++  any       Enable all known instructions including VMX128
++  raw       Show raw (unsimplified) PowerPC mnemonics
++
++Relocation Types
++----------------
++  IMAGE_REL_PPC_ABSOLUTE  (0x00)  No relocation
++  IMAGE_REL_PPC_ADDR64    (0x01)  64-bit absolute address
++  IMAGE_REL_PPC_ADDR32    (0x02)  32-bit absolute address
++  IMAGE_REL_PPC_ADDR24    (0x03)  26-bit branch absolute (shifted left 2)
++  IMAGE_REL_PPC_ADDR16    (0x04)  16-bit address
++  IMAGE_REL_PPC_ADDR14    (0x05)  16-bit address (shifted left 2)
++  IMAGE_REL_PPC_REL24     (0x06)  26-bit PC-relative branch (shifted left 2)
++  IMAGE_REL_PPC_REL14     (0x07)  16-bit PC-relative (shifted left 2)
++  IMAGE_REL_PPC_TOCREL16  (0x08)  16-bit TOC-relative
++  IMAGE_REL_PPC_TOCREL14  (0x09)  16-bit TOC-relative (shifted left 2)
++  IMAGE_REL_PPC_ADDR32NB  (0x0A)  32-bit RVA (no image base)
++  IMAGE_REL_PPC_SECREL    (0x0B)  Section-relative offset
++  IMAGE_REL_PPC_SECTION   (0x0C)  Section index
++  IMAGE_REL_PPC_SECREL16  (0x0F)  16-bit section-relative
++  IMAGE_REL_PPC_REFHI     (0x10)  High 16-bit reference (used with lis)
++  IMAGE_REL_PPC_REFLO     (0x11)  Low 16-bit reference (used with addi/lwz)
++  IMAGE_REL_PPC_PAIR      (0x12)  Paired relocation
++  IMAGE_REL_PPC_SECRELLO  (0x13)  Low 16-bit section-relative
++  IMAGE_REL_PPC_SECRELHI  (0x14)  High 16-bit section-relative
++  IMAGE_REL_PPC_GPREL     (0x15)  GP-relative
++
++VMX128 Instructions
++-------------------
++89 Xbox 360-specific instructions across three primary opcodes:
++
++  Opcode 4: Load/store (lvx128, stvx128, lvlx128, etc.) and vsldoi128
++  Opcode 5: Arithmetic (vaddfp128, vmulfp128, vmaddfp128, etc.),
++            logical (vand128, vor128, vxor128, etc.),
++            pack (vpkshss128, vpkuwum128, etc.), and vperm128
++  Opcode 6: Compare (vcmpeqfp128, vcmpgtfp128, etc. with Rc variants),
++            convert (vcfsx128, vctsxs128, etc.),
++            unary (vrfin128, vrefp128, vrsqrtefp128, etc.),
++            shift/rotate (vrlw128, vslw128, vsraw128, etc.),
++            splat (vspltw128, vspltisw128),
++            and special (vpermwi128, vpkd3d128, vrlimi128, vupkd3d128)
++
++VMX128 extends the vector register file from 32 to 128 registers
++(v0-v127).  Register numbers are encoded using scattered bit fields
++across the instruction word.
+diff --git a/bfd/pe-ppc-be.c b/bfd/pe-ppc-be.c
+new file mode 100644
+index 00000000000..23c34e23f54
+--- /dev/null
++++ b/bfd/pe-ppc-be.c
+@@ -0,0 +1,68 @@
++/* BFD back-end for big-endian PowerPC PE IMAGE COFF files (Xbox 360).
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of BFD, the Binary File Descriptor library.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++   MA 02110-1301, USA.  */
++
++#include "sysdep.h"
++#include "bfd.h"
++
++#define TARGET_SYM             powerpc_pe_be_vec
++#define TARGET_NAME            "pe-powerpcbe"
++#define TARGET_ARCHITECTURE    bfd_arch_powerpc
++#define TARGET_PAGESIZE        4096
++#define TARGET_BIG_ENDIAN      1
++#define TARGET_ARCHIVE         0
++#define TARGET_PRIORITY        0
++
++#define COFF_WITH_PE
++#define PCRELOFFSET       true
++
++/* Long section names not allowed in executable images, only object files.  */
++#define COFF_LONG_SECTION_NAMES 1
++
++#define COFF_SECTION_ALIGNMENT_ENTRIES \
++{ COFF_SECTION_NAME_EXACT_MATCH (".bss"), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 2 }, \
++{ COFF_SECTION_NAME_EXACT_MATCH (".data"), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 2 }, \
++{ COFF_SECTION_NAME_EXACT_MATCH (".rdata"), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 2 }, \
++{ COFF_SECTION_NAME_EXACT_MATCH (".text"), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 2 }, \
++{ COFF_SECTION_NAME_PARTIAL_MATCH (".idata"), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 2 }, \
++{ COFF_SECTION_NAME_PARTIAL_MATCH (".didat"), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 2 }, \
++{ COFF_SECTION_NAME_EXACT_MATCH (".pdata"), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 2 }, \
++{ COFF_SECTION_NAME_PARTIAL_MATCH (".debug"), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 0 }, \
++{ COFF_SECTION_NAME_PARTIAL_MATCH (".gnu.linkonce.wi."), \
++  COFF_ALIGNMENT_FIELD_EMPTY, COFF_ALIGNMENT_FIELD_EMPTY, 0 }
++
++#include "sysdep.h"
++#include "bfd.h"
++#include "libbfd.h"
++#include "coff/powerpc.h"
++#include "coff/internal.h"
++#include "coff/pe.h"
++#include "libcoff.h"
++#include "libpei.h"
++#include "libiberty.h"
++
++#include "coff-ppc-be.c"
+diff --git a/bfd/targets.c b/bfd/targets.c
+index 23333701ec0..68c36bdc612 100644
+--- a/bfd/targets.c
++++ b/bfd/targets.c
+@@ -844,6 +844,7 @@ extern const bfd_target pj_elf32_vec;
+ extern const bfd_target pj_elf32_le_vec;
+ extern const bfd_target plugin_vec;
+ extern const bfd_target powerpc_boot_vec;
++extern const bfd_target powerpc_pe_be_vec;
+ extern const bfd_target powerpc_elf32_vec;
+ extern const bfd_target powerpc_elf32_le_vec;
+ extern const bfd_target powerpc_elf32_fbsd_vec;
+@@ -1231,6 +1232,7 @@ static const bfd_target * const _bfd_target_vector[] =
+ 	&pj_elf32_le_vec,
+ 
+ 	&powerpc_boot_vec,
++	&powerpc_pe_be_vec,
+ 	&powerpc_elf32_vec,
+ 	&powerpc_elf32_le_vec,
+ 	&powerpc_elf32_fbsd_vec,
+diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
+index 9b3aaabfa0a..b79c1dd6ee0 100644
+--- a/gas/config/tc-ppc.c
++++ b/gas/config/tc-ppc.c
+@@ -1406,6 +1406,8 @@ PowerPC options:\n"));
+   fprintf (stream, _("\
+ -maltivec               generate code for AltiVec\n"));
+   fprintf (stream, _("\
++-mvmx128                generate code for Xbox 360 VMX128 instructions\n"));
++  fprintf (stream, _("\
+ -mvsx                   generate code for Vector-Scalar (VSX) instructions\n"));
+   fprintf (stream, _("\
+ -me300                  generate code for PowerPC e300 family\n"));
+diff --git a/gas/configure.tgt b/gas/configure.tgt
+index 7c81bffa16b..91c4795acdc 100644
+--- a/gas/configure.tgt
++++ b/gas/configure.tgt
+@@ -361,6 +361,7 @@ case ${generic_target} in
+   ppc-*-aix[5-9].*)			fmt=coff em=aix5 ;;
+   ppc-*-aix*)				fmt=coff em=aix ;;
+   ppc-*-beos*)				fmt=coff ;;
++  ppc-*-pe*)				fmt=coff em=pe ;;
+   ppc-*-*n*bsd* | ppc-*-elf*)		fmt=elf ;;
+   ppc-*-eabi* | ppc-*-sysv4*)		fmt=elf ;;
+   ppc-*-haiku*)				fmt=elf em=haiku ;;
+diff --git a/include/coff/pe.h b/include/coff/pe.h
+index 59ac6366bf8..45ce78e57f8 100644
+--- a/include/coff/pe.h
++++ b/include/coff/pe.h
+@@ -153,6 +153,7 @@
+ #define IMAGE_FILE_MACHINE_MIPSFPU16         0x0466
+ #define IMAGE_FILE_MACHINE_POWERPC           0x01f0
+ #define IMAGE_FILE_MACHINE_POWERPCFP         0x01f1
++#define IMAGE_FILE_MACHINE_POWERPCBE         0x01f2
+ #define IMAGE_FILE_MACHINE_R10000            0x0168
+ #define IMAGE_FILE_MACHINE_R3000             0x0162
+ #define IMAGE_FILE_MACHINE_R4000             0x0166
+diff --git a/include/coff/powerpc.h b/include/coff/powerpc.h
+new file mode 100644
+index 00000000000..5d6cf5141a9
+--- /dev/null
++++ b/include/coff/powerpc.h
+@@ -0,0 +1,95 @@
++/* PowerPC COFF support for BFD.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of BFD, the Binary File Descriptor library.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software Foundation,
++   Inc., 51 Franklin Street - Fifth Floor, Boston, MA 02110-1301, USA.  */
++
++#ifndef COFF_POWERPC_H
++#define COFF_POWERPC_H
++
++#define COFFPOWERPC 1
++
++#define L_LNNO_SIZE 2
++#define INCLUDE_COMDAT_FIELDS_IN_AUXENT
++#include "coff/external.h"
++
++/* Big-endian PowerPC (Xbox 360).  */
++#define PPCBEMAGIC	0x01f2
++
++#undef  BADMAG
++#define BADMAG(x) ((x).f_magic != PPCBEMAGIC)
++#define POWERPC		1	/* Customize coffcode.h.  */
++
++#define IMAGE_NT_OPTIONAL_HDR_MAGIC	0x10b
++
++#define OMAGIC          0404    /* Object files, eg as output.  */
++#define ZMAGIC          IMAGE_NT_OPTIONAL_HDR_MAGIC    /* Demand load format.  */
++#define STMAGIC		0401	/* Target shlib.  */
++#define SHMAGIC		0443	/* Host   shlib.  */
++
++/* define some NT default values */
++#define NT_SECTION_ALIGNMENT 0x1000
++#define NT_FILE_ALIGNMENT    0x200
++#define NT_DEF_RESERVE       0x100000
++#define NT_DEF_COMMIT        0x1000
++
++/* We use the .rdata section to hold read only data.  */
++#define _LIT	".rdata"
++
++/********************** RELOCATION DIRECTIVES **********************/
++struct external_reloc
++{
++  char r_vaddr[4];
++  char r_symndx[4];
++  char r_type[2];
++};
++
++#define RELOC struct external_reloc
++#define RELSZ 10
++
++/* PowerPC relocation types.  */
++#define IMAGE_REL_PPC_ABSOLUTE	0x0000	/* NOP.  */
++#define IMAGE_REL_PPC_ADDR64	0x0001	/* 64-bit address.  */
++#define IMAGE_REL_PPC_ADDR32	0x0002	/* 32-bit address.  */
++#define IMAGE_REL_PPC_ADDR24	0x0003	/* 26-bit address, shifted left 2.  */
++#define IMAGE_REL_PPC_ADDR16	0x0004	/* 16-bit address.  */
++#define IMAGE_REL_PPC_ADDR14	0x0005	/* 16-bit address, shifted left 2.  */
++#define IMAGE_REL_PPC_REL24	0x0006	/* 26-bit PC-relative, shifted left 2.  */
++#define IMAGE_REL_PPC_REL14	0x0007	/* 16-bit PC-relative, shifted left 2.  */
++#define IMAGE_REL_PPC_TOCREL16	0x0008	/* 16-bit offset from TOC base.  */
++#define IMAGE_REL_PPC_TOCREL14	0x0009	/* 16-bit offset from TOC, shifted left 2.  */
++#define IMAGE_REL_PPC_ADDR32NB	0x000A	/* 32-bit addr without image base.  */
++#define IMAGE_REL_PPC_SECREL	0x000B	/* VA of containing section.  */
++#define IMAGE_REL_PPC_SECTION	0x000C	/* Section header number.  */
++#define IMAGE_REL_PPC_IFGLUE	0x000D	/* Substitute TOC restore insn.  */
++#define IMAGE_REL_PPC_IMGLUE	0x000E	/* Symbol is glue code.  */
++#define IMAGE_REL_PPC_SECREL16	0x000F	/* 16-bit section relative.  */
++#define IMAGE_REL_PPC_REFHI	0x0010	/* High 16-bit reference.  */
++#define IMAGE_REL_PPC_REFLO	0x0011	/* Low 16-bit reference.  */
++#define IMAGE_REL_PPC_PAIR	0x0012	/* Paired relocation.  */
++#define IMAGE_REL_PPC_SECRELLO	0x0013	/* Low 16-bit section relative.  */
++#define IMAGE_REL_PPC_SECRELHI	0x0014	/* High 16-bit section relative.  */
++#define IMAGE_REL_PPC_GPREL	0x0015	/* GP-relative.  */
++#define IMAGE_REL_PPC_TOKEN	0x0016	/* CLR token.  */
++
++/* Relocation type masks and flags.  */
++#define IMAGE_REL_PPC_TYPEMASK	0x00FF
++#define IMAGE_REL_PPC_NEG	0x0100
++#define IMAGE_REL_PPC_BRTAKEN	0x0200
++#define IMAGE_REL_PPC_BRNTAKEN	0x0400
++#define IMAGE_REL_PPC_TOCDEFN	0x0800
++
++#endif /* COFF_POWERPC_H */
+diff --git a/include/opcode/ppc.h b/include/opcode/ppc.h
+index 2e27f6ba93c..13e118e962e 100644
+--- a/include/opcode/ppc.h
++++ b/include/opcode/ppc.h
+@@ -245,6 +245,9 @@ extern const unsigned int spe2_num_opcodes;
+ /* Opcode is only supported by 'future' architecture.  */
+ #define PPC_OPCODE_FUTURE  0x1000000000000ull
+ 
++/* Xbox 360 VMX128 extension.  */
++#define PPC_OPCODE_VMX128  0x2000000000000ull
++
+ /* A macro to extract the major opcode from an instruction.  */
+ #define PPC_OP(i) (((i) >> 26) & 0x3f)
+ 
+diff --git a/ld/configure.tgt b/ld/configure.tgt
+index ea01ccf9a1b..dce7d32cfc0 100644
+--- a/ld/configure.tgt
++++ b/ld/configure.tgt
+@@ -801,6 +801,9 @@ powerpc-*-aix*)		targ_emul=aixppc
+ powerpc-*-beos*)	targ_emul=aixppc
+ 			targ_extra_ofiles=
+ 			;;
++powerpc-*-pe*)		targ_emul=aixppc
++			targ_extra_ofiles=
++			;;
+ powerpc-*-haiku*)	targ_emul=elf32ppchaiku
+ 			;;
+ powerpc-*-windiss*)	targ_emul=elf32ppcwindiss
+diff --git a/opcodes/ppc-dis.c b/opcodes/ppc-dis.c
+index 3e210341228..7eba7097423 100644
+--- a/opcodes/ppc-dis.c
++++ b/opcodes/ppc-dis.c
+@@ -293,6 +293,8 @@ struct ppc_mopt ppc_opts[] = {
+ 		| PPC_OPCODE_PMR | PPC_OPCODE_CACHELCK | PPC_OPCODE_RFMCI
+ 		| PPC_OPCODE_EFS2 | PPC_OPCODE_SPE2),
+     PPC_OPCODE_VLE },
++  { "vmx128",  PPC_OPCODE_PPC | PPC_OPCODE_ALTIVEC,
++    PPC_OPCODE_VMX128 },
+   { "vsx",     PPC_OPCODE_PPC,
+     PPC_OPCODE_VSX },
+ };
+diff --git a/opcodes/ppc-opc.c b/opcodes/ppc-opc.c
+index 712cd31d19e..2b89eb07cdc 100644
+--- a/opcodes/ppc-opc.c
++++ b/opcodes/ppc-opc.c
+@@ -2854,6 +2854,76 @@ extract_thds (uint64_t insn,
+   return value;
+ }
+ 
++/* VMX128 insert/extract functions for scattered register fields.  */
++
++static uint64_t
++insert_vds128 (uint64_t insn,
++	       int64_t value,
++	       ppc_cpu_t dialect ATTRIBUTE_UNUSED,
++	       const char **errmsg ATTRIBUTE_UNUSED)
++{
++  return insn | ((value & 0x1f) << 21) | (((value >> 5) & 0x3) << 2);
++}
++
++static int64_t
++extract_vds128 (uint64_t insn,
++		ppc_cpu_t dialect ATTRIBUTE_UNUSED,
++		int *invalid ATTRIBUTE_UNUSED)
++{
++  return ((insn >> 21) & 0x1f) | (((insn >> 2) & 0x3) << 5);
++}
++
++static uint64_t
++insert_va128 (uint64_t insn,
++	      int64_t value,
++	      ppc_cpu_t dialect ATTRIBUTE_UNUSED,
++	      const char **errmsg ATTRIBUTE_UNUSED)
++{
++  return insn | ((value & 0x1f) << 16) | (value & 0x20) | ((value & 0x40) << 4);
++}
++
++static int64_t
++extract_va128 (uint64_t insn,
++	       ppc_cpu_t dialect ATTRIBUTE_UNUSED,
++	       int *invalid ATTRIBUTE_UNUSED)
++{
++  return ((insn >> 16) & 0x1f) | (insn & 0x20) | ((insn >> 4) & 0x40);
++}
++
++static uint64_t
++insert_vb128 (uint64_t insn,
++	      int64_t value,
++	      ppc_cpu_t dialect ATTRIBUTE_UNUSED,
++	      const char **errmsg ATTRIBUTE_UNUSED)
++{
++  return insn | ((value & 0x1f) << 11) | ((value >> 5) & 0x3);
++}
++
++static int64_t
++extract_vb128 (uint64_t insn,
++	       ppc_cpu_t dialect ATTRIBUTE_UNUSED,
++	       int *invalid ATTRIBUTE_UNUSED)
++{
++  return ((insn >> 11) & 0x1f) | ((insn & 0x3) << 5);
++}
++
++static uint64_t
++insert_vperm128 (uint64_t insn,
++		 int64_t value,
++		 ppc_cpu_t dialect ATTRIBUTE_UNUSED,
++		 const char **errmsg ATTRIBUTE_UNUSED)
++{
++  return insn | ((value & 0x1f) << 16) | ((value & 0xe0) << 1);
++}
++
++static int64_t
++extract_vperm128 (uint64_t insn,
++		  ppc_cpu_t dialect ATTRIBUTE_UNUSED,
++		  int *invalid ATTRIBUTE_UNUSED)
++{
++  return ((insn >> 16) & 0x1f) | ((insn >> 1) & 0xe0);
++}
++
+ /* The operands table.
+ 
+    The fields are bitm, shift, insert, extract, flags.
+@@ -4050,6 +4120,44 @@ const struct powerpc_operand powerpc_operands[] =
+ 
+ #define mi2 mi1 + 1
+   { 0x3, 15, NULL, NULL, 0 },
++
++  /* VMX128 operands with scattered register fields.  */
++
++  /* The VDS128 field (destination/source vector register, 7 bits).
++     Bits are scattered: [25:21] = reg[4:0], [3:2] = reg[6:5].  */
++#define VD128 mi2 + 1
++#define VS128 VD128
++  { 0x7f, PPC_OPSHIFT_INV, insert_vds128, extract_vds128, PPC_OPERAND_VR },
++
++  /* The VA128 field (source A vector register, 7 bits).
++     Bits are scattered: [20:16] = reg[4:0], [5] = reg[5], [10] = reg[6].  */
++#define VA128 VD128 + 1
++  { 0x7f, PPC_OPSHIFT_INV, insert_va128, extract_va128, PPC_OPERAND_VR },
++
++  /* The VB128 field (source B vector register, 7 bits).
++     Bits are scattered: [15:11] = reg[4:0], [1:0] = reg[6:5].  */
++#define VB128 VA128 + 1
++  { 0x7f, PPC_OPSHIFT_INV, insert_vb128, extract_vb128, PPC_OPERAND_VR },
++
++  /* The VC128 field (source C vector register, 3 bits).  */
++#define VC128 VB128 + 1
++  { 0x7, 6, NULL, NULL, PPC_OPERAND_VR },
++
++  /* The VPERM128 field (8-bit permutation immediate).
++     Bits are scattered: [20:16] = imm[4:0], [8:6] = imm[7:5].  */
++#define VPERM128 VC128 + 1
++  { 0xff, PPC_OPSHIFT_INV, insert_vperm128, extract_vperm128, 0 },
++
++  /* The D3DType field (3-bit packed data type).  */
++#define D3DTYPE VPERM128 + 1
++  { 0x7, 18, NULL, NULL, 0 },
++
++  /* The VMASK field (2-bit pack mask) - reuse UIM which has same encoding.  */
++#define VMASK128 UIM
++
++  /* The Zimm field (2-bit rotate/shift amount).  */
++#define ZIMM D3DTYPE + 1
++  { 0x3, 6, NULL, NULL, 0 },
+ };
+ 
+ const unsigned int num_powerpc_operands = ARRAY_SIZE (powerpc_operands);
+@@ -5132,7 +5240,44 @@ const unsigned int num_powerpc_operands = ARRAY_SIZE (powerpc_operands);
+ #define SVP64	PPC_OPCODE_SVP64
+ /* Used to mark extended mnemonic in deprecated field so that -Mraw
+    won't use this variant in disassembly.  */
++
++#define PPCVMX128 PPC_OPCODE_VMX128
+ #define EXT	PPC_OPCODE_RAW
++
++/* VMX128 instruction encoding macros.  These use primary opcodes 4, 5, 6
++   with scattered extended opcode fields.  */
++
++/* VMX128 load/store form (primary opcode 4).  */
++#define VMX128_LS(op, xop) (OP (op) | ((uint64_t)(xop) & 0x7f3))
++#define VMX128_LS_MASK     (OP_MASK | 0x7f3)
++
++/* VMX128 3-register form (primary opcodes 5, 6).  */
++#define VMX128_3(op, xop) (OP (op) | ((uint64_t)(xop) & 0x3d0))
++#define VMX128_3_MASK     (OP_MASK | 0x3d0)
++
++/* VMX128 permutation form (primary opcode 5).  */
++#define VMX128_P(op, xop) (OP (op) | ((uint64_t)(xop) & 0x210))
++#define VMX128_P_MASK     (OP_MASK | 0x210)
++
++/* VMX128 shift double form (primary opcode 4).  */
++#define VMX128_SHIFT(op, xop) (OP (op) | ((uint64_t)(xop) & 0x10))
++#define VMX128_SHIFT_MASK     (OP_MASK | 0x10)
++
++/* VMX128 VX-like form (primary opcode 6).  */
++#define VMX128_VX(op, xop) (OP (op) | ((uint64_t)(xop) & 0x7f0))
++#define VMX128_VX_MASK     (OP_MASK | 0x7f0)
++
++/* VMX128 unary form with VA field zeroed (primary opcode 6).  */
++#define VMX128_1(op, xop) (OP (op) | ((uint64_t)(xop) & 0x7f0))
++#define VMX128_1_MASK     (OP_MASK | (0x1f << 16) | 0x7f0)
++
++/* VMX128 vpermwi128 form (primary opcode 6).  */
++#define VMX128_PERMWI(op, xop) (OP (op) | ((uint64_t)(xop) & 0x630))
++#define VMX128_PERMWI_MASK     (OP_MASK | 0x630)
++
++/* VMX128 vpkd3d128/vrlimi128 form (primary opcode 6).  */
++#define VMX128_PKD3D(op, xop) (OP (op) | ((uint64_t)(xop) & 0x730))
++#define VMX128_PKD3D_MASK     (OP_MASK | 0x730)
+ 
+ /* The opcode table.
+ 
+@@ -6147,6 +6292,95 @@ const struct powerpc_opcode powerpc_opcodes[] = {
+ {"nmaclhwso.",	XO (4, 494,1,1), XO_MASK,    MULHW,	0,		{RT, RA, RB}},
+ {"dcbz_l",	X  (4,1014),	XRT_MASK,    PPCPS,	0,		{RA, RB}},
+ 
++/* VMX128 instructions - primary opcode 4 (load/store).  */
++{"lvsl128",    VMX128_LS(4, 0x003), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"lvsr128",    VMX128_LS(4, 0x043), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"lvewx128",   VMX128_LS(4, 0x083), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"lvx128",     VMX128_LS(4, 0x0C3), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"stvewx128",  VMX128_LS(4, 0x183), VMX128_LS_MASK, PPCVMX128, 0, {VS128, RA0, RB}},
++{"stvx128",    VMX128_LS(4, 0x1C3), VMX128_LS_MASK, PPCVMX128, 0, {VS128, RA0, RB}},
++{"lvxl128",    VMX128_LS(4, 0x2C3), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"stvxl128",   VMX128_LS(4, 0x3C3), VMX128_LS_MASK, PPCVMX128, 0, {VS128, RA0, RB}},
++{"lvlx128",    VMX128_LS(4, 0x403), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"lvrx128",    VMX128_LS(4, 0x443), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"stvlx128",   VMX128_LS(4, 0x503), VMX128_LS_MASK, PPCVMX128, 0, {VS128, RA0, RB}},
++{"stvrx128",   VMX128_LS(4, 0x543), VMX128_LS_MASK, PPCVMX128, 0, {VS128, RA0, RB}},
++{"lvlxl128",   VMX128_LS(4, 0x603), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"lvrxl128",   VMX128_LS(4, 0x643), VMX128_LS_MASK, PPCVMX128, 0, {VD128, RA0, RB}},
++{"stvlxl128",  VMX128_LS(4, 0x703), VMX128_LS_MASK, PPCVMX128, 0, {VS128, RA0, RB}},
++{"stvrxl128",  VMX128_LS(4, 0x743), VMX128_LS_MASK, PPCVMX128, 0, {VS128, RA0, RB}},
++/* VMX128 instructions - primary opcode 4 (shift).  */
++{"vsldoi128",  VMX128_SHIFT(4, 0x10), VMX128_SHIFT_MASK, PPCVMX128, 0, {VD128, VA128, VB128, SHB}},
++
++/* VMX128 instructions - primary opcode 5 (arithmetic/logical).  */
++{"vperm128",   VMX128_P(5, 0x000), VMX128_P_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128, VC128}},
++{"vaddfp128",  VMX128_3(5, 0x010), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vsubfp128",  VMX128_3(5, 0x050), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vmulfp128",  VMX128_3(5, 0x090), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vmaddfp128", VMX128_3(5, 0x0D0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vmaddcfp128",VMX128_3(5, 0x110), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vnmsubfp128",VMX128_3(5, 0x150), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vmsum3fp128",VMX128_3(5, 0x190), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vmsum4fp128",VMX128_3(5, 0x1D0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpkshss128", VMX128_3(5, 0x200), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vand128",    VMX128_3(5, 0x210), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpkshus128", VMX128_3(5, 0x240), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vandc128",   VMX128_3(5, 0x250), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpkswss128", VMX128_3(5, 0x280), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vnor128",    VMX128_3(5, 0x290), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpkswus128", VMX128_3(5, 0x2C0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vor128",     VMX128_3(5, 0x2D0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpkuhum128", VMX128_3(5, 0x300), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vxor128",    VMX128_3(5, 0x310), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpkuhus128", VMX128_3(5, 0x340), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vsel128",    VMX128_3(5, 0x350), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpkuwum128", VMX128_3(5, 0x380), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vslo128",    VMX128_3(5, 0x390), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpkuwus128", VMX128_3(5, 0x3C0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vsro128",    VMX128_3(5, 0x3D0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++
++/* VMX128 instructions - primary opcode 6 (comparison/conversion).  */
++{"vcmpeqfp128",  VMX128_3(6, 0x000), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcmpeqfp128.", VMX128_3(6, 0x040), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vrlw128",      VMX128_3(6, 0x050), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcmpgefp128",  VMX128_3(6, 0x080), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcmpgefp128.", VMX128_3(6, 0x0C0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vslw128",      VMX128_3(6, 0x0D0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcmpgtfp128",  VMX128_3(6, 0x100), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcmpgtfp128.", VMX128_3(6, 0x140), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vsraw128",     VMX128_3(6, 0x150), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcmpbfp128",   VMX128_3(6, 0x180), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcmpbfp128.",  VMX128_3(6, 0x1C0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vsrw128",      VMX128_3(6, 0x1D0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcmpequw128",  VMX128_3(6, 0x200), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vpermwi128",   VMX128_PERMWI(6, 0x210), VMX128_PERMWI_MASK, PPCVMX128, PPCVLE, {VD128, VB128, VPERM128}},
++{"vctsxs128",    VMX128_VX(6, 0x230), VMX128_VX_MASK, PPCVMX128, PPCVLE, {VD128, VB128, SIMM}},
++{"vcmpequw128.", VMX128_3(6, 0x240), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vctuxs128",    VMX128_VX(6, 0x270), VMX128_VX_MASK, PPCVMX128, PPCVLE, {VD128, VB128, UIMM}},
++{"vmaxfp128",    VMX128_3(6, 0x280), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcfsx128",     VMX128_VX(6, 0x2B0), VMX128_VX_MASK, PPCVMX128, PPCVLE, {VD128, VB128, SIMM}},
++{"vminfp128",    VMX128_3(6, 0x2C0), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vcfux128",     VMX128_VX(6, 0x2F0), VMX128_VX_MASK, PPCVMX128, PPCVLE, {VD128, VB128, UIMM}},
++{"vmrghw128",    VMX128_3(6, 0x300), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vrfim128",     VMX128_1(6, 0x330), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vmrglw128",    VMX128_3(6, 0x340), VMX128_3_MASK, PPCVMX128, PPCVLE, {VD128, VA128, VB128}},
++{"vrfin128",     VMX128_1(6, 0x370), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vupkhsb128",   VMX128_1(6, 0x380), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vrfip128",     VMX128_1(6, 0x3B0), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vupklsb128",   VMX128_1(6, 0x3C0), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vrfiz128",     VMX128_1(6, 0x3F0), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vpkd3d128",    VMX128_PKD3D(6, 0x610), VMX128_PKD3D_MASK, PPCVMX128, PPCVLE, {VD128, VB128, D3DTYPE, VMASK128, ZIMM}},
++{"vrefp128",     VMX128_1(6, 0x630), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vrsqrtefp128", VMX128_1(6, 0x670), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vexptefp128",  VMX128_1(6, 0x6B0), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vlogefp128",   VMX128_1(6, 0x6F0), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vrlimi128",    VMX128_PKD3D(6, 0x710), VMX128_PKD3D_MASK, PPCVMX128, PPCVLE, {VD128, VB128, UIMM, ZIMM}},
++{"vspltw128",    VMX128_VX(6, 0x730), VMX128_VX_MASK, PPCVMX128, PPCVLE, {VD128, VB128, UIMM}},
++{"vspltisw128",  VMX128_VX(6, 0x770), VMX128_VX_MASK, PPCVMX128, PPCVLE, {VD128, VB128, SIMM}},
++{"vupkhsh128",   VMX128_1(6, 0x7A0), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vupklsh128",   VMX128_1(6, 0x7E0), VMX128_1_MASK, PPCVMX128, PPCVLE, {VD128, VB128}},
++{"vupkd3d128",   VMX128_VX(6, 0x7F0), VMX128_VX_MASK, PPCVMX128, PPCVLE, {VD128, VB128, UIMM}},
++
+ {"lxvp",	DQXP(6,0),	DQXP_MASK,   POWER10,	PPCVLE,		{XTP, DQ, RA0}},
+ {"stxvp",	DQXP(6,1),	DQXP_MASK,   POWER10,	PPCVLE,		{XSP, DQ, RA0}},
+ 
+-- 
+2.47.0.vfs.0.3.5.g90d546079a
+
+
+From 5c620905ece808cf84cb834121f0cf70543cf992 Mon Sep 17 00:00:00 2001
+From: Luke Street <luke@street.dev>
+Date: Sun, 8 Feb 2026 17:40:07 -0700
+Subject: [PATCH 2/5] Enable VMX128 and AltiVec by default for
+ powerpc-xbox360-pe
+
+Add bfd_mach_ppc_xenon machine type for the Xbox 360 Xenon CPU.  Set
+it in the COFF backend when PPCBEMAGIC is detected, so the disassembler
+and assembler automatically select the correct instruction set.
+
+The disassembler now defaults to the vmx128 dialect for bfd_mach_ppc_xenon,
+so -Mvmx128 is no longer required.  The assembler detects TARGET_OS="pe"
+and enables PPC + AltiVec + VMX128 by default, so -mvmx128 is no longer
+required for the powerpc-xbox360-pe triple.
+---
+ bfd/archures.c      | 1 +
+ bfd/bfd-in2.h       | 1 +
+ bfd/coffcode.h      | 2 +-
+ bfd/cpu-powerpc.c   | 3 ++-
+ gas/config/tc-ppc.c | 6 ++++++
+ opcodes/ppc-dis.c   | 3 +++
+ 6 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/bfd/archures.c b/bfd/archures.c
+index fd22c94d6d6..d3a59df7fc7 100644
+--- a/bfd/archures.c
++++ b/bfd/archures.c
+@@ -250,6 +250,7 @@ DESCRIPTION
+ .#define bfd_mach_ppc_e6500	5007
+ .#define bfd_mach_ppc_titan	83
+ .#define bfd_mach_ppc_vle	84
++.#define bfd_mach_ppc_xenon	85
+ .  bfd_arch_rs6000,    {* IBM RS/6000.  *}
+ .#define bfd_mach_rs6k		6000
+ .#define bfd_mach_rs6k_rs1	6001
+diff --git a/bfd/bfd-in2.h b/bfd/bfd-in2.h
+index bcff44a0f44..40ed54757b3 100644
+--- a/bfd/bfd-in2.h
++++ b/bfd/bfd-in2.h
+@@ -1471,6 +1471,7 @@ enum bfd_architecture
+ #define bfd_mach_ppc_e6500     5007
+ #define bfd_mach_ppc_titan     83
+ #define bfd_mach_ppc_vle       84
++#define bfd_mach_ppc_xenon     85
+   bfd_arch_rs6000,    /* IBM RS/6000.  */
+ #define bfd_mach_rs6k          6000
+ #define bfd_mach_rs6k_rs1      6001
+diff --git a/bfd/coffcode.h b/bfd/coffcode.h
+index f2ecdb478d7..9961f82fd8d 100644
+--- a/bfd/coffcode.h
++++ b/bfd/coffcode.h
+@@ -2223,7 +2223,7 @@ coff_set_arch_mach_hook (bfd *abfd, void * filehdr)
+ #ifdef PPCBEMAGIC
+     case PPCBEMAGIC:
+       arch = bfd_arch_powerpc;
+-      machine = bfd_mach_ppc;
++      machine = bfd_mach_ppc_xenon;
+       break;
+ #endif
+ #ifdef LOONGARCH64MAGIC
+diff --git a/bfd/cpu-powerpc.c b/bfd/cpu-powerpc.c
+index ffb0ec4a4da..2737e927d63 100644
+--- a/bfd/cpu-powerpc.c
++++ b/bfd/cpu-powerpc.c
+@@ -154,5 +154,6 @@ const bfd_arch_info_type bfd_powerpc_archs[] =
+   },
+ 
+   N (64, bfd_mach_ppc_e5500, "powerpc:e5500", false, bfd_powerpc_archs + 21),
+-  N (64, bfd_mach_ppc_e6500, "powerpc:e6500", false, NULL)
++  N (64, bfd_mach_ppc_e6500, "powerpc:e6500", false, bfd_powerpc_archs + 22),
++  N (32, bfd_mach_ppc_xenon, "powerpc:xenon", false, NULL)
+ };
+diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
+index b79c1dd6ee0..639d989f984 100644
+--- a/gas/config/tc-ppc.c
++++ b/gas/config/tc-ppc.c
+@@ -1486,6 +1486,10 @@ ppc_set_cpu (void)
+ 	ppc_cpu |= PPC_OPCODE_POWER;
+       else if (strcmp (default_cpu, "rs6000") == 0)
+ 	ppc_cpu |= PPC_OPCODE_POWER;
++      else if (strcmp (default_os, "pe") == 0
++	       && startswith (default_cpu, "powerpc"))
++	/* Xbox 360 (Xenon) big-endian PowerPC PE/COFF target.  */
++	ppc_cpu |= ppc_parse_cpu (ppc_cpu, &sticky, "vmx128");
+       else if (startswith (default_cpu, "powerpc"))
+ 	ppc_cpu |= PPC_OPCODE_PPC;
+       else
+@@ -1532,6 +1536,8 @@ ppc_mach (void)
+     return bfd_mach_ppc_titan;
+   else if (ppc_cpu & PPC_OPCODE_VLE)
+     return bfd_mach_ppc_vle;
++  else if (ppc_cpu & PPC_OPCODE_VMX128)
++    return bfd_mach_ppc_xenon;
+   else
+     return bfd_mach_ppc;
+ }
+diff --git a/opcodes/ppc-dis.c b/opcodes/ppc-dis.c
+index 7eba7097423..5dcf003b650 100644
+--- a/opcodes/ppc-dis.c
++++ b/opcodes/ppc-dis.c
+@@ -406,6 +406,9 @@ powerpc_init_dialect (struct disassemble_info *info)
+     case bfd_mach_ppc_vle:
+       dialect = ppc_parse_cpu (dialect, &sticky, "vle");
+       break;
++    case bfd_mach_ppc_xenon:
++      out.dialect = ppc_parse_cpu (out.dialect, &out.sticky, "vmx128");
++      break;
+     default:
+       if (info->arch == bfd_arch_powerpc)
+ 	dialect = ppc_parse_cpu (dialect, &sticky, "power11") | PPC_OPCODE_ANY;
+-- 
+2.47.0.vfs.0.3.5.g90d546079a
+
+
+From f4506e2c855d6eaef89b379baeabf9485aadaed7 Mon Sep 17 00:00:00 2001
+From: Luke Street <luke@street.dev>
+Date: Sun, 8 Feb 2026 17:47:46 -0700
+Subject: [PATCH 3/5] GAS: output pe-powerpcbe format for TE_PE target
+
+Set the GAS output format to "pe-powerpcbe" when the target environment
+is PE (TE_PE), so the assembler produces Xbox 360 PE/COFF object files
+with the correct IMAGE_FILE_MACHINE_POWERPCBE machine type instead of
+XCOFF.
+---
+ gas/config/tc-ppc.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
+index 639d989f984..557dd12154f 100644
+--- a/gas/config/tc-ppc.c
++++ b/gas/config/tc-ppc.c
+@@ -1546,7 +1546,9 @@ extern const char*
+ ppc_target_format (void)
+ {
+ #ifdef OBJ_COFF
+-#if TE_POWERMAC
++#if defined(TE_PE)
++  return "pe-powerpcbe";
++#elif TE_POWERMAC
+   return "xcoff-powermac";
+ #else
+ #  ifdef TE_AIX5
+-- 
+2.47.0.vfs.0.3.5.g90d546079a
+
+
+From 2a5b633eaf985abea557843fd994c609baceba0b Mon Sep 17 00:00:00 2001
+From: Luke Street <luke@street.dev>
+Date: Sun, 8 Feb 2026 17:49:31 -0700
+Subject: [PATCH 4/5] doc: update xbox360-ppc-coff.txt for default VMX128
+ behavior
+
+Reflect that VMX128 and AltiVec are now enabled by default for the
+powerpc-xbox360-pe triple, and that the assembler outputs pe-powerpcbe
+format.  Remove the now-unnecessary -Mvmx128 and -mvmx128 flags from
+the primary usage examples.
+---
+ bfd/doc/xbox360-ppc-coff.txt | 21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/bfd/doc/xbox360-ppc-coff.txt b/bfd/doc/xbox360-ppc-coff.txt
+index 1c1b15ec275..086ab9609c9 100644
+--- a/bfd/doc/xbox360-ppc-coff.txt
++++ b/bfd/doc/xbox360-ppc-coff.txt
+@@ -7,13 +7,16 @@ Target
+   BFD name:   pe-powerpcbe
+   Machine:    IMAGE_FILE_MACHINE_POWERPCBE (0x01F2)
+   Format:     PE/COFF with little-endian headers, big-endian data
+-  Arch:       bfd_arch_powerpc (powerpc:common)
++  Arch:       bfd_arch_powerpc (powerpc:xenon)
+ 
+ The Xbox 360 (Xenon) CPU is a big-endian PowerPC with AltiVec and the
+ VMX128 extension.  Object files produced by the Xbox 360 MSVC toolchain
+ use standard PE/COFF structure with little-endian structural headers and
+ big-endian code/data sections.
+ 
++AltiVec and VMX128 instructions are enabled by default for this target.
++No extra flags are needed for assembly or disassembly.
++
+ Configure and Build
+ -------------------
+   mkdir build && cd build
+@@ -23,22 +26,24 @@ Configure and Build
+ 
+ objdump Usage
+ -------------
+-  objdump -d -Mvmx128 file.obj      # disassemble with VMX128
+-  objdump -d -Many file.obj         # all instruction sets
+-  objdump -dr -Mvmx128 file.obj     # disassembly with inline relocations
++  objdump -d file.obj               # disassemble (VMX128 enabled by default)
++  objdump -dr file.obj              # disassembly with inline relocations
+   objdump -x file.obj               # full headers, symbols, relocations
+ 
+ Assembler (GAS) Usage
+ ---------------------
+-  as -mppc -mvmx128 -o output.o input.s
++  as -o output.o input.s            # VMX128 enabled by default for this triple
+ 
+-  The .machine directive also works:
++  The -mvmx128 flag and .machine directive can also be used explicitly:
++    as -mppc -mvmx128 -o output.o input.s
+     .machine "vmx128"
+ 
++  The assembler outputs pe-powerpcbe format (IMAGE_FILE_MACHINE_POWERPCBE).
++
+ Disassembler Flags (-M)
+ -----------------------
+-  vmx128    Enable Xbox 360 VMX128 instructions (v0-v127)
+-  any       Enable all known instructions including VMX128
++  vmx128    Xbox 360 VMX128 instructions (default for pe-powerpcbe)
++  any       All known instructions including VMX128
+   raw       Show raw (unsimplified) PowerPC mnemonics
+ 
+ Relocation Types
+-- 
+2.47.0.vfs.0.3.5.g90d546079a
+
+
+From 7550d1506d610227fcede1a7d9001caea220a27a Mon Sep 17 00:00:00 2001
+From: Luke Street <luke@street.dev>
+Date: Sun, 8 Feb 2026 18:25:18 -0700
+Subject: [PATCH 5/5] Rename Xbox 360 references to Xenon
+
+Use the SoC name (Xenon) instead of the product name (Xbox 360)
+in comments and config patterns.
+---
+ bfd/coff-ppc-be.c                                |  2 +-
+ bfd/config.bfd                                   |  2 +-
+ .../{xbox360-ppc-coff.txt => xenon-ppc-coff.txt} | 16 ++++++++--------
+ bfd/pe-ppc-be.c                                  |  2 +-
+ gas/config/tc-ppc.c                              |  4 ++--
+ include/coff/powerpc.h                           |  2 +-
+ include/opcode/ppc.h                             |  2 +-
+ 7 files changed, 15 insertions(+), 15 deletions(-)
+ rename bfd/doc/{xbox360-ppc-coff.txt => xenon-ppc-coff.txt} (88%)
+
+diff --git a/bfd/coff-ppc-be.c b/bfd/coff-ppc-be.c
+index 81e0201b9bd..c35ca238fc7 100644
+--- a/bfd/coff-ppc-be.c
++++ b/bfd/coff-ppc-be.c
+@@ -1,4 +1,4 @@
+-/* BFD back-end for big-endian PowerPC COFF files (Xbox 360).
++/* BFD back-end for big-endian PowerPC COFF files (Xenon).
+    Copyright (C) 2026 Free Software Foundation, Inc.
+ 
+    This file is part of BFD, the Binary File Descriptor library.
+diff --git a/bfd/config.bfd b/bfd/config.bfd
+index 2e59175aa94..25a8c717e76 100644
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -1160,7 +1160,7 @@ case "${targ}" in
+     targ_selvecs="rs6000_xcoff_vec powerpc_elf32_vec powerpc_elf32_le_vec powerpc_boot_vec"
+     targ64_selvecs="powerpc_elf64_vec powerpc_elf64_le_vec powerpc_elf64_fbsd_vec"
+     ;;
+-  powerpc-*-pe* | powerpc-*-xbox360*)
++  powerpc-*-pe* | powerpc-*-xenon*)
+     targ_defvec=powerpc_pe_be_vec
+     targ_selvecs="powerpc_pe_be_vec powerpc_elf32_vec"
+     ;;
+diff --git a/bfd/doc/xbox360-ppc-coff.txt b/bfd/doc/xenon-ppc-coff.txt
+similarity index 88%
+rename from bfd/doc/xbox360-ppc-coff.txt
+rename to bfd/doc/xenon-ppc-coff.txt
+index 086ab9609c9..58aa71217bf 100644
+--- a/bfd/doc/xbox360-ppc-coff.txt
++++ b/bfd/doc/xenon-ppc-coff.txt
+@@ -1,16 +1,16 @@
+-Xbox 360 Big-Endian PowerPC COFF Support
+-=========================================
++Xenon Big-Endian PowerPC COFF Support
++=====================================
+ 
+ Target
+ ------
+-  Triple:     powerpc-xbox360-pe
++  Triple:     powerpc-xenon-pe
+   BFD name:   pe-powerpcbe
+   Machine:    IMAGE_FILE_MACHINE_POWERPCBE (0x01F2)
+   Format:     PE/COFF with little-endian headers, big-endian data
+   Arch:       bfd_arch_powerpc (powerpc:xenon)
+ 
+-The Xbox 360 (Xenon) CPU is a big-endian PowerPC with AltiVec and the
+-VMX128 extension.  Object files produced by the Xbox 360 MSVC toolchain
++The Xenon CPU is a big-endian PowerPC with AltiVec and the
++VMX128 extension.  Object files produced by the Xenon MSVC toolchain
+ use standard PE/COFF structure with little-endian structural headers and
+ big-endian code/data sections.
+ 
+@@ -20,7 +20,7 @@ No extra flags are needed for assembly or disassembly.
+ Configure and Build
+ -------------------
+   mkdir build && cd build
+-  ../configure --target=powerpc-xbox360-pe --enable-targets=all \
++  ../configure --target=powerpc-xenon-pe --enable-targets=all \
+                --disable-gdb --disable-gdbserver
+   make
+ 
+@@ -42,7 +42,7 @@ Assembler (GAS) Usage
+ 
+ Disassembler Flags (-M)
+ -----------------------
+-  vmx128    Xbox 360 VMX128 instructions (default for pe-powerpcbe)
++  vmx128    Xenon VMX128 instructions (default for pe-powerpcbe)
+   any       All known instructions including VMX128
+   raw       Show raw (unsimplified) PowerPC mnemonics
+ 
+@@ -71,7 +71,7 @@ Relocation Types
+ 
+ VMX128 Instructions
+ -------------------
+-89 Xbox 360-specific instructions across three primary opcodes:
++89 Xenon-specific instructions across three primary opcodes:
+ 
+   Opcode 4: Load/store (lvx128, stvx128, lvlx128, etc.) and vsldoi128
+   Opcode 5: Arithmetic (vaddfp128, vmulfp128, vmaddfp128, etc.),
+diff --git a/bfd/pe-ppc-be.c b/bfd/pe-ppc-be.c
+index 23c34e23f54..3e5ae1977fb 100644
+--- a/bfd/pe-ppc-be.c
++++ b/bfd/pe-ppc-be.c
+@@ -1,4 +1,4 @@
+-/* BFD back-end for big-endian PowerPC PE IMAGE COFF files (Xbox 360).
++/* BFD back-end for big-endian PowerPC PE IMAGE COFF files (Xenon).
+    Copyright (C) 2026 Free Software Foundation, Inc.
+ 
+    This file is part of BFD, the Binary File Descriptor library.
+diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
+index 557dd12154f..d9c45c4eb5e 100644
+--- a/gas/config/tc-ppc.c
++++ b/gas/config/tc-ppc.c
+@@ -1406,7 +1406,7 @@ PowerPC options:\n"));
+   fprintf (stream, _("\
+ -maltivec               generate code for AltiVec\n"));
+   fprintf (stream, _("\
+--mvmx128                generate code for Xbox 360 VMX128 instructions\n"));
++-mvmx128                generate code for Xenon VMX128 instructions\n"));
+   fprintf (stream, _("\
+ -mvsx                   generate code for Vector-Scalar (VSX) instructions\n"));
+   fprintf (stream, _("\
+@@ -1488,7 +1488,7 @@ ppc_set_cpu (void)
+ 	ppc_cpu |= PPC_OPCODE_POWER;
+       else if (strcmp (default_os, "pe") == 0
+ 	       && startswith (default_cpu, "powerpc"))
+-	/* Xbox 360 (Xenon) big-endian PowerPC PE/COFF target.  */
++	/* Xenon big-endian PowerPC PE/COFF target.  */
+ 	ppc_cpu |= ppc_parse_cpu (ppc_cpu, &sticky, "vmx128");
+       else if (startswith (default_cpu, "powerpc"))
+ 	ppc_cpu |= PPC_OPCODE_PPC;
+diff --git a/include/coff/powerpc.h b/include/coff/powerpc.h
+index 5d6cf5141a9..0c919cd2f7c 100644
+--- a/include/coff/powerpc.h
++++ b/include/coff/powerpc.h
+@@ -26,7 +26,7 @@
+ #define INCLUDE_COMDAT_FIELDS_IN_AUXENT
+ #include "coff/external.h"
+ 
+-/* Big-endian PowerPC (Xbox 360).  */
++/* Big-endian PowerPC (Xenon).  */
+ #define PPCBEMAGIC	0x01f2
+ 
+ #undef  BADMAG
+diff --git a/include/opcode/ppc.h b/include/opcode/ppc.h
+index 13e118e962e..70208193b1e 100644
+--- a/include/opcode/ppc.h
++++ b/include/opcode/ppc.h
+@@ -245,7 +245,7 @@ extern const unsigned int spe2_num_opcodes;
+ /* Opcode is only supported by 'future' architecture.  */
+ #define PPC_OPCODE_FUTURE  0x1000000000000ull
+ 
+-/* Xbox 360 VMX128 extension.  */
++/* Xenon VMX128 extension.  */
+ #define PPC_OPCODE_VMX128  0x2000000000000ull
+ 
+ /* A macro to extract the major opcode from an instruction.  */
+-- 
+2.47.0.vfs.0.3.5.g90d546079a
+
