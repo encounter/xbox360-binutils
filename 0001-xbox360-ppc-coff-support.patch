@@ -1,62 +1,3 @@
-From 5007a43171054db58433659d3deb9445f1e5ac65 Mon Sep 17 00:00:00 2001
-From: Luke Street <luke@street.dev>
-Date: Sun, 8 Feb 2026 17:22:04 -0700
-Subject: [PATCH 1/5] Add Xbox 360 big-endian PowerPC COFF support
- (pe-powerpcbe)
-
-Add objdump and GAS support for Xbox 360 (Xenon) object files, which
-use PE/COFF format with IMAGE_FILE_MACHINE_POWERPCBE (0x01F2).  The
-format uses little-endian structural headers with big-endian PowerPC
-code and data sections.
-
-BFD changes:
-- New include/coff/powerpc.h with PPCBEMAGIC and IMAGE_REL_PPC_*
-  relocation type definitions
-- New bfd/coff-ppc-be.c backend with relocation howtos for all 22
-  PowerPC COFF relocation types
-- New bfd/pe-ppc-be.c PE wrapper defining powerpc_pe_be_vec target
-- Register PPCBEMAGIC in coffcode.h for arch/magic detection
-- Register target in targets.c, config.bfd, configure.ac, Makefile
-
-Opcodes changes:
-- Add PPC_OPCODE_VMX128 flag for Xbox 360 VMX128 extension
-- Add 89 VMX128 instructions across primary opcodes 4, 5, and 6
-- Add VD128/VA128/VB128 operand types with insert/extract functions
-  for 7-bit scattered register encoding (v0-v127)
-- Add vmx128 CPU option to ppc_opts[] and ppc-dis.c
-
-GAS changes:
-- Add -mvmx128 command-line option and help text
-- Add powerpc-xbox360-pe target to gas/configure.tgt
-- Support .machine "vmx128" directive
-
-Tested against Xbox 360 object files with 100% instruction decode rate
-and verified assembly round-trip against powerpc-rs reference encodings.
----
- bfd/Makefile.am              |   2 +
- bfd/Makefile.in              |   2 +
- bfd/coff-ppc-be.c            | 367 +++++++++++++++++++++++++++++++++++
- bfd/coffcode.h               |  17 ++
- bfd/config.bfd               |   4 +
- bfd/configure                |   1 +
- bfd/configure.ac             |   1 +
- bfd/doc/xbox360-ppc-coff.txt |  84 ++++++++
- bfd/pe-ppc-be.c              |  68 +++++++
- bfd/targets.c                |   2 +
- gas/config/tc-ppc.c          |   2 +
- gas/configure.tgt            |   1 +
- include/coff/pe.h            |   1 +
- include/coff/powerpc.h       |  95 +++++++++
- include/opcode/ppc.h         |   3 +
- ld/configure.tgt             |   3 +
- opcodes/ppc-dis.c            |   2 +
- opcodes/ppc-opc.c            | 234 ++++++++++++++++++++++
- 18 files changed, 889 insertions(+)
- create mode 100644 bfd/coff-ppc-be.c
- create mode 100644 bfd/doc/xbox360-ppc-coff.txt
- create mode 100644 bfd/pe-ppc-be.c
- create mode 100644 include/coff/powerpc.h
-
 diff --git a/bfd/Makefile.am b/bfd/Makefile.am
 index 4987ac9cccc..312e7746f77 100644
 --- a/bfd/Makefile.am
@@ -97,13 +38,37 @@ index 8a670ad1d05..9f8c5387881 100644
  	pe-sh.c \
  	pef.c \
  	pei-arm-wince.c \
+diff --git a/bfd/archures.c b/bfd/archures.c
+index fd22c94d6d6..d3a59df7fc7 100644
+--- a/bfd/archures.c
++++ b/bfd/archures.c
+@@ -250,6 +250,7 @@ DESCRIPTION
+ .#define bfd_mach_ppc_e6500	5007
+ .#define bfd_mach_ppc_titan	83
+ .#define bfd_mach_ppc_vle	84
++.#define bfd_mach_ppc_xenon	85
+ .  bfd_arch_rs6000,    {* IBM RS/6000.  *}
+ .#define bfd_mach_rs6k		6000
+ .#define bfd_mach_rs6k_rs1	6001
+diff --git a/bfd/bfd-in2.h b/bfd/bfd-in2.h
+index bcff44a0f44..40ed54757b3 100644
+--- a/bfd/bfd-in2.h
++++ b/bfd/bfd-in2.h
+@@ -1471,6 +1471,7 @@ enum bfd_architecture
+ #define bfd_mach_ppc_e6500     5007
+ #define bfd_mach_ppc_titan     83
+ #define bfd_mach_ppc_vle       84
++#define bfd_mach_ppc_xenon     85
+   bfd_arch_rs6000,    /* IBM RS/6000.  */
+ #define bfd_mach_rs6k          6000
+ #define bfd_mach_rs6k_rs1      6001
 diff --git a/bfd/coff-ppc-be.c b/bfd/coff-ppc-be.c
 new file mode 100644
-index 00000000000..81e0201b9bd
+index 00000000000..156f06b024b
 --- /dev/null
 +++ b/bfd/coff-ppc-be.c
-@@ -0,0 +1,367 @@
-+/* BFD back-end for big-endian PowerPC COFF files (Xbox 360).
+@@ -0,0 +1,366 @@
++/* BFD back-end for big-endian PowerPC COFF files (Xenon).
 +   Copyright (C) 2026 Free Software Foundation, Inc.
 +
 +   This file is part of BFD, the Binary File Descriptor library.
@@ -425,7 +390,6 @@ index 00000000000..81e0201b9bd
 +  15,				/* Ar_max_namelen.  */
 +  0,				/* match priority.  */
 +  TARGET_KEEP_UNUSED_SECTION_SYMBOLS, /* keep unused section symbols.  */
-+  TARGET_MERGE_SECTIONS,
 +
 +  /* Data conversion functions.  Big-endian data.  */
 +  bfd_getb64, bfd_getb_signed_64, bfd_putb64,
@@ -471,7 +435,7 @@ index 00000000000..81e0201b9bd
 +  COFF_SWAP_TABLE
 +};
 diff --git a/bfd/coffcode.h b/bfd/coffcode.h
-index b81195dd2ec..f2ecdb478d7 100644
+index b81195dd2ec..9961f82fd8d 100644
 --- a/bfd/coffcode.h
 +++ b/bfd/coffcode.h
 @@ -2220,6 +2220,12 @@ coff_set_arch_mach_hook (bfd *abfd, void * filehdr)
@@ -481,7 +445,7 @@ index b81195dd2ec..f2ecdb478d7 100644
 +#ifdef PPCBEMAGIC
 +    case PPCBEMAGIC:
 +      arch = bfd_arch_powerpc;
-+      machine = bfd_mach_ppc;
++      machine = bfd_mach_ppc_xenon;
 +      break;
 +#endif
  #ifdef LOONGARCH64MAGIC
@@ -513,14 +477,14 @@ index b81195dd2ec..f2ecdb478d7 100644
  #include "Your aouthdr magic number is not being set!"
  #else
 diff --git a/bfd/config.bfd b/bfd/config.bfd
-index 4e5a838fe4e..2e59175aa94 100644
+index 4e5a838fe4e..25a8c717e76 100644
 --- a/bfd/config.bfd
 +++ b/bfd/config.bfd
 @@ -1160,6 +1160,10 @@ case "${targ}" in
      targ_selvecs="rs6000_xcoff_vec powerpc_elf32_vec powerpc_elf32_le_vec powerpc_boot_vec"
      targ64_selvecs="powerpc_elf64_vec powerpc_elf64_le_vec powerpc_elf64_fbsd_vec"
      ;;
-+  powerpc-*-pe* | powerpc-*-xbox360*)
++  powerpc-*-pe* | powerpc-*-xenon*)
 +    targ_defvec=powerpc_pe_be_vec
 +    targ_selvecs="powerpc_pe_be_vec powerpc_elf32_vec"
 +    ;;
@@ -551,53 +515,70 @@ index 5879a04785d..efa8d7a9a01 100644
      pru_elf32_vec)		 tb="$tb elf32-pru.lo elf32.lo $elf" ;;
      riscv_elf32_vec)		 tb="$tb elf32-riscv.lo elfxx-riscv.lo elf-ifunc.lo elf32.lo $elf" ;;
      riscv_elf64_vec)		 tb="$tb elf64-riscv.lo elf64.lo elfxx-riscv.lo elf-ifunc.lo elf32.lo $elf"; target_size=64 ;;
-diff --git a/bfd/doc/xbox360-ppc-coff.txt b/bfd/doc/xbox360-ppc-coff.txt
+diff --git a/bfd/cpu-powerpc.c b/bfd/cpu-powerpc.c
+index ffb0ec4a4da..2737e927d63 100644
+--- a/bfd/cpu-powerpc.c
++++ b/bfd/cpu-powerpc.c
+@@ -154,5 +154,6 @@ const bfd_arch_info_type bfd_powerpc_archs[] =
+   },
+ 
+   N (64, bfd_mach_ppc_e5500, "powerpc:e5500", false, bfd_powerpc_archs + 21),
+-  N (64, bfd_mach_ppc_e6500, "powerpc:e6500", false, NULL)
++  N (64, bfd_mach_ppc_e6500, "powerpc:e6500", false, bfd_powerpc_archs + 22),
++  N (32, bfd_mach_ppc_xenon, "powerpc:xenon", false, NULL)
+ };
+diff --git a/bfd/doc/xenon-ppc-coff.txt b/bfd/doc/xenon-ppc-coff.txt
 new file mode 100644
-index 00000000000..1c1b15ec275
+index 00000000000..58aa71217bf
 --- /dev/null
-+++ b/bfd/doc/xbox360-ppc-coff.txt
-@@ -0,0 +1,84 @@
-+Xbox 360 Big-Endian PowerPC COFF Support
-+=========================================
++++ b/bfd/doc/xenon-ppc-coff.txt
+@@ -0,0 +1,89 @@
++Xenon Big-Endian PowerPC COFF Support
++=====================================
 +
 +Target
 +------
-+  Triple:     powerpc-xbox360-pe
++  Triple:     powerpc-xenon-pe
 +  BFD name:   pe-powerpcbe
 +  Machine:    IMAGE_FILE_MACHINE_POWERPCBE (0x01F2)
 +  Format:     PE/COFF with little-endian headers, big-endian data
-+  Arch:       bfd_arch_powerpc (powerpc:common)
++  Arch:       bfd_arch_powerpc (powerpc:xenon)
 +
-+The Xbox 360 (Xenon) CPU is a big-endian PowerPC with AltiVec and the
-+VMX128 extension.  Object files produced by the Xbox 360 MSVC toolchain
++The Xenon CPU is a big-endian PowerPC with AltiVec and the
++VMX128 extension.  Object files produced by the Xenon MSVC toolchain
 +use standard PE/COFF structure with little-endian structural headers and
 +big-endian code/data sections.
++
++AltiVec and VMX128 instructions are enabled by default for this target.
++No extra flags are needed for assembly or disassembly.
 +
 +Configure and Build
 +-------------------
 +  mkdir build && cd build
-+  ../configure --target=powerpc-xbox360-pe --enable-targets=all \
++  ../configure --target=powerpc-xenon-pe --enable-targets=all \
 +               --disable-gdb --disable-gdbserver
 +  make
 +
 +objdump Usage
 +-------------
-+  objdump -d -Mvmx128 file.obj      # disassemble with VMX128
-+  objdump -d -Many file.obj         # all instruction sets
-+  objdump -dr -Mvmx128 file.obj     # disassembly with inline relocations
++  objdump -d file.obj               # disassemble (VMX128 enabled by default)
++  objdump -dr file.obj              # disassembly with inline relocations
 +  objdump -x file.obj               # full headers, symbols, relocations
 +
 +Assembler (GAS) Usage
 +---------------------
-+  as -mppc -mvmx128 -o output.o input.s
++  as -o output.o input.s            # VMX128 enabled by default for this triple
 +
-+  The .machine directive also works:
++  The -mvmx128 flag and .machine directive can also be used explicitly:
++    as -mppc -mvmx128 -o output.o input.s
 +    .machine "vmx128"
++
++  The assembler outputs pe-powerpcbe format (IMAGE_FILE_MACHINE_POWERPCBE).
 +
 +Disassembler Flags (-M)
 +-----------------------
-+  vmx128    Enable Xbox 360 VMX128 instructions (v0-v127)
-+  any       Enable all known instructions including VMX128
++  vmx128    Xenon VMX128 instructions (default for pe-powerpcbe)
++  any       All known instructions including VMX128
 +  raw       Show raw (unsimplified) PowerPC mnemonics
 +
 +Relocation Types
@@ -625,7 +606,7 @@ index 00000000000..1c1b15ec275
 +
 +VMX128 Instructions
 +-------------------
-+89 Xbox 360-specific instructions across three primary opcodes:
++89 Xenon-specific instructions across three primary opcodes:
 +
 +  Opcode 4: Load/store (lvx128, stvx128, lvlx128, etc.) and vsldoi128
 +  Opcode 5: Arithmetic (vaddfp128, vmulfp128, vmaddfp128, etc.),
@@ -643,11 +624,11 @@ index 00000000000..1c1b15ec275
 +across the instruction word.
 diff --git a/bfd/pe-ppc-be.c b/bfd/pe-ppc-be.c
 new file mode 100644
-index 00000000000..23c34e23f54
+index 00000000000..3e5ae1977fb
 --- /dev/null
 +++ b/bfd/pe-ppc-be.c
 @@ -0,0 +1,68 @@
-+/* BFD back-end for big-endian PowerPC PE IMAGE COFF files (Xbox 360).
++/* BFD back-end for big-endian PowerPC PE IMAGE COFF files (Xenon).
 +   Copyright (C) 2026 Free Software Foundation, Inc.
 +
 +   This file is part of BFD, the Binary File Descriptor library.
@@ -736,18 +717,83 @@ index 23333701ec0..68c36bdc612 100644
  	&powerpc_elf32_le_vec,
  	&powerpc_elf32_fbsd_vec,
 diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
-index 9b3aaabfa0a..b79c1dd6ee0 100644
+index 9b3aaabfa0a..6a379d880ae 100644
 --- a/gas/config/tc-ppc.c
 +++ b/gas/config/tc-ppc.c
 @@ -1406,6 +1406,8 @@ PowerPC options:\n"));
    fprintf (stream, _("\
  -maltivec               generate code for AltiVec\n"));
    fprintf (stream, _("\
-+-mvmx128                generate code for Xbox 360 VMX128 instructions\n"));
++-mvmx128                generate code for Xenon VMX128 instructions\n"));
 +  fprintf (stream, _("\
  -mvsx                   generate code for Vector-Scalar (VSX) instructions\n"));
    fprintf (stream, _("\
  -me300                  generate code for PowerPC e300 family\n"));
+@@ -1484,6 +1486,10 @@ ppc_set_cpu (void)
+ 	ppc_cpu |= PPC_OPCODE_POWER;
+       else if (strcmp (default_cpu, "rs6000") == 0)
+ 	ppc_cpu |= PPC_OPCODE_POWER;
++      else if (strcmp (default_os, "pe") == 0
++	       && startswith (default_cpu, "powerpc"))
++	/* Xenon big-endian PowerPC PE/COFF target.  */
++	ppc_cpu |= ppc_parse_cpu (ppc_cpu, &sticky, "vmx128");
+       else if (startswith (default_cpu, "powerpc"))
+ 	ppc_cpu |= PPC_OPCODE_PPC;
+       else
+@@ -1530,6 +1536,8 @@ ppc_mach (void)
+     return bfd_mach_ppc_titan;
+   else if (ppc_cpu & PPC_OPCODE_VLE)
+     return bfd_mach_ppc_vle;
++  else if (ppc_cpu & PPC_OPCODE_VMX128)
++    return bfd_mach_ppc_xenon;
+   else
+     return bfd_mach_ppc;
+ }
+@@ -1538,7 +1546,9 @@ extern const char*
+ ppc_target_format (void)
+ {
+ #ifdef OBJ_COFF
+-#if TE_POWERMAC
++#if defined(TE_PE)
++  return "pe-powerpcbe";
++#elif TE_POWERMAC
+   return "xcoff-powermac";
+ #else
+ #  ifdef TE_AIX5
+@@ -7689,7 +7699,7 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
+ 	  && strcmp (S_GET_NAME (fixP->fx_addsy), ".TOC.") == 0)
+ 	symbol_get_bfdsym (fixP->fx_addsy)->flags |= BSF_KEEP;
+     }
+-#else
++#elif defined (OBJ_XCOFF)
+   if (fixP->fx_r_type == BFD_RELOC_PPC_TOC16
+       || fixP->fx_r_type == BFD_RELOC_PPC_TOC16_HI
+       || fixP->fx_r_type == BFD_RELOC_PPC_TOC16_LO)
+@@ -7719,6 +7729,8 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
+ 			  - fieldval);
+   else
+     fixP->fx_addnumber = 0;
++#else
++  fixP->fx_addnumber = 0;
+ #endif
+ }
+ 
+diff --git a/gas/config/tc-ppc.h b/gas/config/tc-ppc.h
+index 97e2f4ed197..1f3cc3bcda8 100644
+--- a/gas/config/tc-ppc.h
++++ b/gas/config/tc-ppc.h
+@@ -30,8 +30,9 @@ struct fix;
+ #define TARGET_BYTES_BIG_ENDIAN 1
+ #endif
+ 
+-/* If OBJ_COFF is defined we are assembling XCOFF for AIX or PowerMac.  */
+-#ifdef OBJ_COFF
++/* If OBJ_COFF is defined we are assembling XCOFF for AIX or PowerMac,
++   but not for PE targets (e.g. Xbox 360 / Xenon).  */
++#if defined (OBJ_COFF) && !defined (TE_PE)
+ #define OBJ_XCOFF
+ #endif
+ 
 diff --git a/gas/configure.tgt b/gas/configure.tgt
 index 7c81bffa16b..91c4795acdc 100644
 --- a/gas/configure.tgt
@@ -774,7 +820,7 @@ index 59ac6366bf8..45ce78e57f8 100644
  #define IMAGE_FILE_MACHINE_R4000             0x0166
 diff --git a/include/coff/powerpc.h b/include/coff/powerpc.h
 new file mode 100644
-index 00000000000..5d6cf5141a9
+index 00000000000..0c919cd2f7c
 --- /dev/null
 +++ b/include/coff/powerpc.h
 @@ -0,0 +1,95 @@
@@ -806,7 +852,7 @@ index 00000000000..5d6cf5141a9
 +#define INCLUDE_COMDAT_FIELDS_IN_AUXENT
 +#include "coff/external.h"
 +
-+/* Big-endian PowerPC (Xbox 360).  */
++/* Big-endian PowerPC (Xenon).  */
 +#define PPCBEMAGIC	0x01f2
 +
 +#undef  BADMAG
@@ -874,35 +920,21 @@ index 00000000000..5d6cf5141a9
 +
 +#endif /* COFF_POWERPC_H */
 diff --git a/include/opcode/ppc.h b/include/opcode/ppc.h
-index 2e27f6ba93c..13e118e962e 100644
+index 2e27f6ba93c..70208193b1e 100644
 --- a/include/opcode/ppc.h
 +++ b/include/opcode/ppc.h
 @@ -245,6 +245,9 @@ extern const unsigned int spe2_num_opcodes;
  /* Opcode is only supported by 'future' architecture.  */
  #define PPC_OPCODE_FUTURE  0x1000000000000ull
  
-+/* Xbox 360 VMX128 extension.  */
++/* Xenon VMX128 extension.  */
 +#define PPC_OPCODE_VMX128  0x2000000000000ull
 +
  /* A macro to extract the major opcode from an instruction.  */
  #define PPC_OP(i) (((i) >> 26) & 0x3f)
  
-diff --git a/ld/configure.tgt b/ld/configure.tgt
-index ea01ccf9a1b..dce7d32cfc0 100644
---- a/ld/configure.tgt
-+++ b/ld/configure.tgt
-@@ -801,6 +801,9 @@ powerpc-*-aix*)		targ_emul=aixppc
- powerpc-*-beos*)	targ_emul=aixppc
- 			targ_extra_ofiles=
- 			;;
-+powerpc-*-pe*)		targ_emul=aixppc
-+			targ_extra_ofiles=
-+			;;
- powerpc-*-haiku*)	targ_emul=elf32ppchaiku
- 			;;
- powerpc-*-windiss*)	targ_emul=elf32ppcwindiss
 diff --git a/opcodes/ppc-dis.c b/opcodes/ppc-dis.c
-index 3e210341228..7eba7097423 100644
+index 3e210341228..94208e045c4 100644
 --- a/opcodes/ppc-dis.c
 +++ b/opcodes/ppc-dis.c
 @@ -293,6 +293,8 @@ struct ppc_mopt ppc_opts[] = {
@@ -914,6 +946,16 @@ index 3e210341228..7eba7097423 100644
    { "vsx",     PPC_OPCODE_PPC,
      PPC_OPCODE_VSX },
  };
+@@ -404,6 +406,9 @@ powerpc_init_dialect (struct disassemble_info *info)
+     case bfd_mach_ppc_vle:
+       dialect = ppc_parse_cpu (dialect, &sticky, "vle");
+       break;
++    case bfd_mach_ppc_xenon:
++      dialect = ppc_parse_cpu (dialect, &sticky, "vmx128");
++      break;
+     default:
+       if (info->arch == bfd_arch_powerpc)
+ 	dialect = ppc_parse_cpu (dialect, &sticky, "power11") | PPC_OPCODE_ANY;
 diff --git a/opcodes/ppc-opc.c b/opcodes/ppc-opc.c
 index 712cd31d19e..2b89eb07cdc 100644
 --- a/opcodes/ppc-opc.c
@@ -1181,383 +1223,3 @@ index 712cd31d19e..2b89eb07cdc 100644
  {"lxvp",	DQXP(6,0),	DQXP_MASK,   POWER10,	PPCVLE,		{XTP, DQ, RA0}},
  {"stxvp",	DQXP(6,1),	DQXP_MASK,   POWER10,	PPCVLE,		{XSP, DQ, RA0}},
  
--- 
-2.47.0.vfs.0.3.5.g90d546079a
-
-
-From 5c620905ece808cf84cb834121f0cf70543cf992 Mon Sep 17 00:00:00 2001
-From: Luke Street <luke@street.dev>
-Date: Sun, 8 Feb 2026 17:40:07 -0700
-Subject: [PATCH 2/5] Enable VMX128 and AltiVec by default for
- powerpc-xbox360-pe
-
-Add bfd_mach_ppc_xenon machine type for the Xbox 360 Xenon CPU.  Set
-it in the COFF backend when PPCBEMAGIC is detected, so the disassembler
-and assembler automatically select the correct instruction set.
-
-The disassembler now defaults to the vmx128 dialect for bfd_mach_ppc_xenon,
-so -Mvmx128 is no longer required.  The assembler detects TARGET_OS="pe"
-and enables PPC + AltiVec + VMX128 by default, so -mvmx128 is no longer
-required for the powerpc-xbox360-pe triple.
----
- bfd/archures.c      | 1 +
- bfd/bfd-in2.h       | 1 +
- bfd/coffcode.h      | 2 +-
- bfd/cpu-powerpc.c   | 3 ++-
- gas/config/tc-ppc.c | 6 ++++++
- opcodes/ppc-dis.c   | 3 +++
- 6 files changed, 14 insertions(+), 2 deletions(-)
-
-diff --git a/bfd/archures.c b/bfd/archures.c
-index fd22c94d6d6..d3a59df7fc7 100644
---- a/bfd/archures.c
-+++ b/bfd/archures.c
-@@ -250,6 +250,7 @@ DESCRIPTION
- .#define bfd_mach_ppc_e6500	5007
- .#define bfd_mach_ppc_titan	83
- .#define bfd_mach_ppc_vle	84
-+.#define bfd_mach_ppc_xenon	85
- .  bfd_arch_rs6000,    {* IBM RS/6000.  *}
- .#define bfd_mach_rs6k		6000
- .#define bfd_mach_rs6k_rs1	6001
-diff --git a/bfd/bfd-in2.h b/bfd/bfd-in2.h
-index bcff44a0f44..40ed54757b3 100644
---- a/bfd/bfd-in2.h
-+++ b/bfd/bfd-in2.h
-@@ -1471,6 +1471,7 @@ enum bfd_architecture
- #define bfd_mach_ppc_e6500     5007
- #define bfd_mach_ppc_titan     83
- #define bfd_mach_ppc_vle       84
-+#define bfd_mach_ppc_xenon     85
-   bfd_arch_rs6000,    /* IBM RS/6000.  */
- #define bfd_mach_rs6k          6000
- #define bfd_mach_rs6k_rs1      6001
-diff --git a/bfd/coffcode.h b/bfd/coffcode.h
-index f2ecdb478d7..9961f82fd8d 100644
---- a/bfd/coffcode.h
-+++ b/bfd/coffcode.h
-@@ -2223,7 +2223,7 @@ coff_set_arch_mach_hook (bfd *abfd, void * filehdr)
- #ifdef PPCBEMAGIC
-     case PPCBEMAGIC:
-       arch = bfd_arch_powerpc;
--      machine = bfd_mach_ppc;
-+      machine = bfd_mach_ppc_xenon;
-       break;
- #endif
- #ifdef LOONGARCH64MAGIC
-diff --git a/bfd/cpu-powerpc.c b/bfd/cpu-powerpc.c
-index ffb0ec4a4da..2737e927d63 100644
---- a/bfd/cpu-powerpc.c
-+++ b/bfd/cpu-powerpc.c
-@@ -154,5 +154,6 @@ const bfd_arch_info_type bfd_powerpc_archs[] =
-   },
- 
-   N (64, bfd_mach_ppc_e5500, "powerpc:e5500", false, bfd_powerpc_archs + 21),
--  N (64, bfd_mach_ppc_e6500, "powerpc:e6500", false, NULL)
-+  N (64, bfd_mach_ppc_e6500, "powerpc:e6500", false, bfd_powerpc_archs + 22),
-+  N (32, bfd_mach_ppc_xenon, "powerpc:xenon", false, NULL)
- };
-diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
-index b79c1dd6ee0..639d989f984 100644
---- a/gas/config/tc-ppc.c
-+++ b/gas/config/tc-ppc.c
-@@ -1486,6 +1486,10 @@ ppc_set_cpu (void)
- 	ppc_cpu |= PPC_OPCODE_POWER;
-       else if (strcmp (default_cpu, "rs6000") == 0)
- 	ppc_cpu |= PPC_OPCODE_POWER;
-+      else if (strcmp (default_os, "pe") == 0
-+	       && startswith (default_cpu, "powerpc"))
-+	/* Xbox 360 (Xenon) big-endian PowerPC PE/COFF target.  */
-+	ppc_cpu |= ppc_parse_cpu (ppc_cpu, &sticky, "vmx128");
-       else if (startswith (default_cpu, "powerpc"))
- 	ppc_cpu |= PPC_OPCODE_PPC;
-       else
-@@ -1532,6 +1536,8 @@ ppc_mach (void)
-     return bfd_mach_ppc_titan;
-   else if (ppc_cpu & PPC_OPCODE_VLE)
-     return bfd_mach_ppc_vle;
-+  else if (ppc_cpu & PPC_OPCODE_VMX128)
-+    return bfd_mach_ppc_xenon;
-   else
-     return bfd_mach_ppc;
- }
-diff --git a/opcodes/ppc-dis.c b/opcodes/ppc-dis.c
-index 7eba7097423..5dcf003b650 100644
---- a/opcodes/ppc-dis.c
-+++ b/opcodes/ppc-dis.c
-@@ -406,6 +406,9 @@ powerpc_init_dialect (struct disassemble_info *info)
-     case bfd_mach_ppc_vle:
-       dialect = ppc_parse_cpu (dialect, &sticky, "vle");
-       break;
-+    case bfd_mach_ppc_xenon:
-+      out.dialect = ppc_parse_cpu (out.dialect, &out.sticky, "vmx128");
-+      break;
-     default:
-       if (info->arch == bfd_arch_powerpc)
- 	dialect = ppc_parse_cpu (dialect, &sticky, "power11") | PPC_OPCODE_ANY;
--- 
-2.47.0.vfs.0.3.5.g90d546079a
-
-
-From f4506e2c855d6eaef89b379baeabf9485aadaed7 Mon Sep 17 00:00:00 2001
-From: Luke Street <luke@street.dev>
-Date: Sun, 8 Feb 2026 17:47:46 -0700
-Subject: [PATCH 3/5] GAS: output pe-powerpcbe format for TE_PE target
-
-Set the GAS output format to "pe-powerpcbe" when the target environment
-is PE (TE_PE), so the assembler produces Xbox 360 PE/COFF object files
-with the correct IMAGE_FILE_MACHINE_POWERPCBE machine type instead of
-XCOFF.
----
- gas/config/tc-ppc.c | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
-diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
-index 639d989f984..557dd12154f 100644
---- a/gas/config/tc-ppc.c
-+++ b/gas/config/tc-ppc.c
-@@ -1546,7 +1546,9 @@ extern const char*
- ppc_target_format (void)
- {
- #ifdef OBJ_COFF
--#if TE_POWERMAC
-+#if defined(TE_PE)
-+  return "pe-powerpcbe";
-+#elif TE_POWERMAC
-   return "xcoff-powermac";
- #else
- #  ifdef TE_AIX5
--- 
-2.47.0.vfs.0.3.5.g90d546079a
-
-
-From 2a5b633eaf985abea557843fd994c609baceba0b Mon Sep 17 00:00:00 2001
-From: Luke Street <luke@street.dev>
-Date: Sun, 8 Feb 2026 17:49:31 -0700
-Subject: [PATCH 4/5] doc: update xbox360-ppc-coff.txt for default VMX128
- behavior
-
-Reflect that VMX128 and AltiVec are now enabled by default for the
-powerpc-xbox360-pe triple, and that the assembler outputs pe-powerpcbe
-format.  Remove the now-unnecessary -Mvmx128 and -mvmx128 flags from
-the primary usage examples.
----
- bfd/doc/xbox360-ppc-coff.txt | 21 +++++++++++++--------
- 1 file changed, 13 insertions(+), 8 deletions(-)
-
-diff --git a/bfd/doc/xbox360-ppc-coff.txt b/bfd/doc/xbox360-ppc-coff.txt
-index 1c1b15ec275..086ab9609c9 100644
---- a/bfd/doc/xbox360-ppc-coff.txt
-+++ b/bfd/doc/xbox360-ppc-coff.txt
-@@ -7,13 +7,16 @@ Target
-   BFD name:   pe-powerpcbe
-   Machine:    IMAGE_FILE_MACHINE_POWERPCBE (0x01F2)
-   Format:     PE/COFF with little-endian headers, big-endian data
--  Arch:       bfd_arch_powerpc (powerpc:common)
-+  Arch:       bfd_arch_powerpc (powerpc:xenon)
- 
- The Xbox 360 (Xenon) CPU is a big-endian PowerPC with AltiVec and the
- VMX128 extension.  Object files produced by the Xbox 360 MSVC toolchain
- use standard PE/COFF structure with little-endian structural headers and
- big-endian code/data sections.
- 
-+AltiVec and VMX128 instructions are enabled by default for this target.
-+No extra flags are needed for assembly or disassembly.
-+
- Configure and Build
- -------------------
-   mkdir build && cd build
-@@ -23,22 +26,24 @@ Configure and Build
- 
- objdump Usage
- -------------
--  objdump -d -Mvmx128 file.obj      # disassemble with VMX128
--  objdump -d -Many file.obj         # all instruction sets
--  objdump -dr -Mvmx128 file.obj     # disassembly with inline relocations
-+  objdump -d file.obj               # disassemble (VMX128 enabled by default)
-+  objdump -dr file.obj              # disassembly with inline relocations
-   objdump -x file.obj               # full headers, symbols, relocations
- 
- Assembler (GAS) Usage
- ---------------------
--  as -mppc -mvmx128 -o output.o input.s
-+  as -o output.o input.s            # VMX128 enabled by default for this triple
- 
--  The .machine directive also works:
-+  The -mvmx128 flag and .machine directive can also be used explicitly:
-+    as -mppc -mvmx128 -o output.o input.s
-     .machine "vmx128"
- 
-+  The assembler outputs pe-powerpcbe format (IMAGE_FILE_MACHINE_POWERPCBE).
-+
- Disassembler Flags (-M)
- -----------------------
--  vmx128    Enable Xbox 360 VMX128 instructions (v0-v127)
--  any       Enable all known instructions including VMX128
-+  vmx128    Xbox 360 VMX128 instructions (default for pe-powerpcbe)
-+  any       All known instructions including VMX128
-   raw       Show raw (unsimplified) PowerPC mnemonics
- 
- Relocation Types
--- 
-2.47.0.vfs.0.3.5.g90d546079a
-
-
-From 7550d1506d610227fcede1a7d9001caea220a27a Mon Sep 17 00:00:00 2001
-From: Luke Street <luke@street.dev>
-Date: Sun, 8 Feb 2026 18:25:18 -0700
-Subject: [PATCH 5/5] Rename Xbox 360 references to Xenon
-
-Use the SoC name (Xenon) instead of the product name (Xbox 360)
-in comments and config patterns.
----
- bfd/coff-ppc-be.c                                |  2 +-
- bfd/config.bfd                                   |  2 +-
- .../{xbox360-ppc-coff.txt => xenon-ppc-coff.txt} | 16 ++++++++--------
- bfd/pe-ppc-be.c                                  |  2 +-
- gas/config/tc-ppc.c                              |  4 ++--
- include/coff/powerpc.h                           |  2 +-
- include/opcode/ppc.h                             |  2 +-
- 7 files changed, 15 insertions(+), 15 deletions(-)
- rename bfd/doc/{xbox360-ppc-coff.txt => xenon-ppc-coff.txt} (88%)
-
-diff --git a/bfd/coff-ppc-be.c b/bfd/coff-ppc-be.c
-index 81e0201b9bd..c35ca238fc7 100644
---- a/bfd/coff-ppc-be.c
-+++ b/bfd/coff-ppc-be.c
-@@ -1,4 +1,4 @@
--/* BFD back-end for big-endian PowerPC COFF files (Xbox 360).
-+/* BFD back-end for big-endian PowerPC COFF files (Xenon).
-    Copyright (C) 2026 Free Software Foundation, Inc.
- 
-    This file is part of BFD, the Binary File Descriptor library.
-diff --git a/bfd/config.bfd b/bfd/config.bfd
-index 2e59175aa94..25a8c717e76 100644
---- a/bfd/config.bfd
-+++ b/bfd/config.bfd
-@@ -1160,7 +1160,7 @@ case "${targ}" in
-     targ_selvecs="rs6000_xcoff_vec powerpc_elf32_vec powerpc_elf32_le_vec powerpc_boot_vec"
-     targ64_selvecs="powerpc_elf64_vec powerpc_elf64_le_vec powerpc_elf64_fbsd_vec"
-     ;;
--  powerpc-*-pe* | powerpc-*-xbox360*)
-+  powerpc-*-pe* | powerpc-*-xenon*)
-     targ_defvec=powerpc_pe_be_vec
-     targ_selvecs="powerpc_pe_be_vec powerpc_elf32_vec"
-     ;;
-diff --git a/bfd/doc/xbox360-ppc-coff.txt b/bfd/doc/xenon-ppc-coff.txt
-similarity index 88%
-rename from bfd/doc/xbox360-ppc-coff.txt
-rename to bfd/doc/xenon-ppc-coff.txt
-index 086ab9609c9..58aa71217bf 100644
---- a/bfd/doc/xbox360-ppc-coff.txt
-+++ b/bfd/doc/xenon-ppc-coff.txt
-@@ -1,16 +1,16 @@
--Xbox 360 Big-Endian PowerPC COFF Support
--=========================================
-+Xenon Big-Endian PowerPC COFF Support
-+=====================================
- 
- Target
- ------
--  Triple:     powerpc-xbox360-pe
-+  Triple:     powerpc-xenon-pe
-   BFD name:   pe-powerpcbe
-   Machine:    IMAGE_FILE_MACHINE_POWERPCBE (0x01F2)
-   Format:     PE/COFF with little-endian headers, big-endian data
-   Arch:       bfd_arch_powerpc (powerpc:xenon)
- 
--The Xbox 360 (Xenon) CPU is a big-endian PowerPC with AltiVec and the
--VMX128 extension.  Object files produced by the Xbox 360 MSVC toolchain
-+The Xenon CPU is a big-endian PowerPC with AltiVec and the
-+VMX128 extension.  Object files produced by the Xenon MSVC toolchain
- use standard PE/COFF structure with little-endian structural headers and
- big-endian code/data sections.
- 
-@@ -20,7 +20,7 @@ No extra flags are needed for assembly or disassembly.
- Configure and Build
- -------------------
-   mkdir build && cd build
--  ../configure --target=powerpc-xbox360-pe --enable-targets=all \
-+  ../configure --target=powerpc-xenon-pe --enable-targets=all \
-                --disable-gdb --disable-gdbserver
-   make
- 
-@@ -42,7 +42,7 @@ Assembler (GAS) Usage
- 
- Disassembler Flags (-M)
- -----------------------
--  vmx128    Xbox 360 VMX128 instructions (default for pe-powerpcbe)
-+  vmx128    Xenon VMX128 instructions (default for pe-powerpcbe)
-   any       All known instructions including VMX128
-   raw       Show raw (unsimplified) PowerPC mnemonics
- 
-@@ -71,7 +71,7 @@ Relocation Types
- 
- VMX128 Instructions
- -------------------
--89 Xbox 360-specific instructions across three primary opcodes:
-+89 Xenon-specific instructions across three primary opcodes:
- 
-   Opcode 4: Load/store (lvx128, stvx128, lvlx128, etc.) and vsldoi128
-   Opcode 5: Arithmetic (vaddfp128, vmulfp128, vmaddfp128, etc.),
-diff --git a/bfd/pe-ppc-be.c b/bfd/pe-ppc-be.c
-index 23c34e23f54..3e5ae1977fb 100644
---- a/bfd/pe-ppc-be.c
-+++ b/bfd/pe-ppc-be.c
-@@ -1,4 +1,4 @@
--/* BFD back-end for big-endian PowerPC PE IMAGE COFF files (Xbox 360).
-+/* BFD back-end for big-endian PowerPC PE IMAGE COFF files (Xenon).
-    Copyright (C) 2026 Free Software Foundation, Inc.
- 
-    This file is part of BFD, the Binary File Descriptor library.
-diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
-index 557dd12154f..d9c45c4eb5e 100644
---- a/gas/config/tc-ppc.c
-+++ b/gas/config/tc-ppc.c
-@@ -1406,7 +1406,7 @@ PowerPC options:\n"));
-   fprintf (stream, _("\
- -maltivec               generate code for AltiVec\n"));
-   fprintf (stream, _("\
---mvmx128                generate code for Xbox 360 VMX128 instructions\n"));
-+-mvmx128                generate code for Xenon VMX128 instructions\n"));
-   fprintf (stream, _("\
- -mvsx                   generate code for Vector-Scalar (VSX) instructions\n"));
-   fprintf (stream, _("\
-@@ -1488,7 +1488,7 @@ ppc_set_cpu (void)
- 	ppc_cpu |= PPC_OPCODE_POWER;
-       else if (strcmp (default_os, "pe") == 0
- 	       && startswith (default_cpu, "powerpc"))
--	/* Xbox 360 (Xenon) big-endian PowerPC PE/COFF target.  */
-+	/* Xenon big-endian PowerPC PE/COFF target.  */
- 	ppc_cpu |= ppc_parse_cpu (ppc_cpu, &sticky, "vmx128");
-       else if (startswith (default_cpu, "powerpc"))
- 	ppc_cpu |= PPC_OPCODE_PPC;
-diff --git a/include/coff/powerpc.h b/include/coff/powerpc.h
-index 5d6cf5141a9..0c919cd2f7c 100644
---- a/include/coff/powerpc.h
-+++ b/include/coff/powerpc.h
-@@ -26,7 +26,7 @@
- #define INCLUDE_COMDAT_FIELDS_IN_AUXENT
- #include "coff/external.h"
- 
--/* Big-endian PowerPC (Xbox 360).  */
-+/* Big-endian PowerPC (Xenon).  */
- #define PPCBEMAGIC	0x01f2
- 
- #undef  BADMAG
-diff --git a/include/opcode/ppc.h b/include/opcode/ppc.h
-index 13e118e962e..70208193b1e 100644
---- a/include/opcode/ppc.h
-+++ b/include/opcode/ppc.h
-@@ -245,7 +245,7 @@ extern const unsigned int spe2_num_opcodes;
- /* Opcode is only supported by 'future' architecture.  */
- #define PPC_OPCODE_FUTURE  0x1000000000000ull
- 
--/* Xbox 360 VMX128 extension.  */
-+/* Xenon VMX128 extension.  */
- #define PPC_OPCODE_VMX128  0x2000000000000ull
- 
- /* A macro to extract the major opcode from an instruction.  */
--- 
-2.47.0.vfs.0.3.5.g90d546079a
-
