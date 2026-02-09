@@ -45,6 +45,8 @@ jobs:
     name: Build macOS
     runs-on: macos-latest
     steps:
+      - name: Install dependencies
+        run: brew install texinfo
       - name: Checkout
         uses: actions/checkout@v4
       - name: Build

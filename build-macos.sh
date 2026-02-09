@@ -7,9 +7,6 @@ for patch in ../*.patch; do
   patch -N -p1 -i "$patch"
 done
 export CFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=10.11"
-# Create a makeinfo shim (texinfo is not installed on macOS CI runners)
-mkdir -p shim && printf '#!/bin/sh\nexit 0\n' > shim/makeinfo && chmod +x shim/makeinfo
-export PATH="$(pwd)/shim:$PATH"
 ./configure --target=powerpc-xenon-pe --prefix="$PREFIX" --disable-nls --disable-shared --disable-gprof --disable-ld --disable-gold --without-zstd --with-system-zlib
 make -j$(nproc) configure-host
 make -j$(nproc)
