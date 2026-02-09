@@ -7,9 +7,9 @@ for patch in ../*.patch; do
   patch -N -p1 -i "$patch"
 done
 export CFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=10.11"
-# Prevent make from trying to rebuild .info files (requires makeinfo)
-find . -name '*.info' -exec touch {} +
 ./configure --target=powerpc-xenon-pe --prefix="$PREFIX" --disable-nls --disable-shared --disable-gprof --disable-ld --disable-gold --without-zstd --with-system-zlib
 make -j$(nproc) configure-host
+# Touch .info files after configure so they're newer than generated .texi files
+find . -name '*.info' -exec touch {} +
 make -j$(nproc)
 make install-strip
