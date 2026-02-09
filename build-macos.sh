@@ -7,8 +7,7 @@ for patch in ../*.patch; do
   patch -N -p1 -i "$patch"
 done
 export CFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=10.11"
-export MAKEINFO=true
-./configure --target=powerpc-xenon-pe --prefix="$PREFIX" --disable-nls --disable-shared --disable-gprof --disable-ld --disable-gold --without-zstd --with-system-zlib
+./configure --target=powerpc-xenon-pe --prefix="$PREFIX" --disable-nls --disable-shared --disable-gprof --disable-ld --disable-gold --without-zstd --with-system-zlib MAKEINFO=true
 make -j$(nproc) configure-host
-make -j$(nproc)
-make install-strip
+make -j$(nproc) MAKEINFO=true
+make install-strip MAKEINFO=true
