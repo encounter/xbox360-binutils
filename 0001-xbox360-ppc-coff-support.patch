@@ -718,7 +718,7 @@ index 23333701ec0..68c36bdc612 100644
  	&powerpc_elf32_le_vec,
  	&powerpc_elf32_fbsd_vec,
 diff --git a/gas/config/tc-ppc.c b/gas/config/tc-ppc.c
-index 9b3aaabfa0a..f6a5986184d 100644
+index 9b3aaabfa0a..28d1c76ab70 100644
 --- a/gas/config/tc-ppc.c
 +++ b/gas/config/tc-ppc.c
 @@ -1406,6 +1406,8 @@ PowerPC options:\n"));
@@ -761,36 +761,43 @@ index 9b3aaabfa0a..f6a5986184d 100644
    return "xcoff-powermac";
  #else
  #  ifdef TE_AIX5
-@@ -2826,6 +2836,37 @@ ppc_xcoff_parse_cons (expressionS *exp, unsigned int nbytes)
+@@ -2826,6 +2836,44 @@ ppc_xcoff_parse_cons (expressionS *exp, unsigned int nbytes)
  }
  
  #endif /* OBJ_XCOFF */
 +
 +#if defined (OBJ_COFF) && defined (TE_PE)
-+/* Parse %hi() / %lo() relocation prefixes for PE COFF targets.
-+   We cannot use the @h / @l suffix syntax here because PE defines
-+   LEX_AT to allow '@' inside symbol names (needed for MSVC mangling).
++/* Parse @h / @l relocation suffixes for PE COFF targets.
++   PE defines LEX_AT to allow '@' inside symbol names (needed for
++   MSVC name mangling), so @h / @l will only be recognized after
++   quoted symbol names or symbols that don't contain '@'.
 +
-+   Returns BFD_RELOC_NONE if no prefix is found.  Otherwise advances
-+   *STR_P past the prefix (including the opening parenthesis) and
-+   returns the relocation code.  The caller is responsible for
-+   consuming the closing parenthesis after parsing the inner
-+   expression.  */
++   Called after the expression has been parsed.  Checks whether
++   *STR_P points to "@h" or "@l" and advances past it if so.  */
 +
 +static bfd_reloc_code_real_type
-+ppc_pe_prefix (char **str_p)
++ppc_pe_suffix (char **str_p)
 +{
 +  char *str = *str_p;
 +
-+  if (strncasecmp (str, "%hi(", 4) == 0)
++  if (*str == '@')
 +    {
-+      *str_p = str + 4;
-+      return BFD_RELOC_HI16_S;
-+    }
-+  if (strncasecmp (str, "%lo(", 4) == 0)
-+    {
-+      *str_p = str + 4;
-+      return BFD_RELOC_LO16;
++      if (TOLOWER (str[1]) == 'h'
++	  && (str[2] == ',' || str[2] == '(' || str[2] == '\0'
++	      || is_end_of_stmt (str[2])
++	      || is_whitespace (str[2])))
++	{
++	  *str_p = str + 2;
++	  return BFD_RELOC_HI16_S;
++	}
++      if (TOLOWER (str[1]) == 'l'
++	  && (str[2] == ',' || str[2] == '(' || str[2] == '\0'
++	      || is_end_of_stmt (str[2])
++	      || is_whitespace (str[2])))
++	{
++	  *str_p = str + 2;
++	  return BFD_RELOC_LO16;
++	}
 +    }
 +
 +  return BFD_RELOC_NONE;
@@ -799,7 +806,7 @@ index 9b3aaabfa0a..f6a5986184d 100644
  
  #if defined (OBJ_XCOFF) || defined (OBJ_ELF)
  /* See whether a symbol is in the TOC section.  */
-@@ -2992,6 +3033,21 @@ fixup_size (bfd_reloc_code_real_type reloc, bool *pc_relative)
+@@ -2992,6 +3040,21 @@ fixup_size (bfd_reloc_code_real_type reloc, bool *pc_relative)
    unsigned int size = 0;
    bool pcrel = false;
  
@@ -821,7 +828,7 @@ index 9b3aaabfa0a..f6a5986184d 100644
    switch (reloc)
      {
        /* This switch statement must handle all BFD_RELOC values
-@@ -3201,11 +3257,13 @@ fixup_size (bfd_reloc_code_real_type reloc, bool *pc_relative)
+@@ -3201,11 +3264,13 @@ fixup_size (bfd_reloc_code_real_type reloc, bool *pc_relative)
  #ifndef OBJ_XCOFF
      case BFD_RELOC_CTOR:
  #endif
@@ -835,38 +842,22 @@ index 9b3aaabfa0a..f6a5986184d 100644
        size = ppc_obj64 ? 8 : 4;
        break;
  
-@@ -3467,6 +3525,9 @@ md_assemble (char *str)
- 	}
- 
-       /* Gather the operand.  */
-+#if defined (OBJ_COFF) && defined (TE_PE)
-+      bfd_reloc_code_real_type pe_reloc = ppc_pe_prefix (&str);
-+#endif
-       hold = input_line_pointer;
-       input_line_pointer = str;
-       cr_operand = ((operand->flags & PPC_OPERAND_CR_BIT) != 0
-@@ -3475,6 +3536,15 @@ md_assemble (char *str)
+@@ -3475,6 +3540,9 @@ md_assemble (char *str)
        cr_operand = false;
        str = input_line_pointer;
        input_line_pointer = hold;
 +#if defined (OBJ_COFF) && defined (TE_PE)
-+      if (pe_reloc != BFD_RELOC_NONE)
-+	{
-+	  if (*str != ')')
-+	    as_bad (_("missing closing parenthesis"));
-+	  else
-+	    ++str;
-+	}
++      bfd_reloc_code_real_type pe_reloc = ppc_pe_suffix (&str);
 +#endif
  
        resolve_register (&ex);
  
-@@ -3593,6 +3663,27 @@ md_assemble (char *str)
+@@ -3593,6 +3661,27 @@ md_assemble (char *str)
  		break;
  	      }
  #endif /* OBJ_ELF */
 +#if defined (OBJ_COFF) && defined (TE_PE)
-+	  /* Allow %hi(), %lo() on constants.  */
++	  /* Allow @h, @l on constants.  */
 +	  if (pe_reloc != BFD_RELOC_NONE)
 +	    switch (pe_reloc)
 +	      {
@@ -889,7 +880,7 @@ index 9b3aaabfa0a..f6a5986184d 100644
  	  insn = ppc_insert_operand (insn, operand, val, ppc_cpu, NULL, 0);
  	}
        else
-@@ -3769,6 +3860,10 @@ md_assemble (char *str)
+@@ -3769,6 +3858,10 @@ md_assemble (char *str)
  #ifdef OBJ_XCOFF
  	  reloc = ppc_xcoff_suffix (&str);
  #endif /* OBJ_XCOFF */
@@ -900,7 +891,7 @@ index 9b3aaabfa0a..f6a5986184d 100644
  
  	  if (reloc != BFD_RELOC_NONE)
  	    ;
-@@ -7352,11 +7447,13 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
+@@ -7352,11 +7445,13 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
  
  	case BFD_RELOC_VTABLE_INHERIT:
  	case BFD_RELOC_VTABLE_ENTRY:
@@ -914,12 +905,12 @@ index 9b3aaabfa0a..f6a5986184d 100644
  	case BFD_RELOC_32_PLT_PCREL:
  	case BFD_RELOC_PPC_EMB_NADDR32:
  	case BFD_RELOC_PPC64_TOC:
-@@ -7489,6 +7586,13 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
+@@ -7489,6 +7584,13 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
  	  fixP->fx_done = 0;
  	  break;
  
 +#if defined (OBJ_COFF) && defined (TE_PE)
-+	  /* These can appear with %hi() / %lo() in instructions.  */
++	  /* These can appear with @h / @l in instructions.  */
 +	case BFD_RELOC_LO16:
 +	case BFD_RELOC_HI16_S:
 +	  break;
@@ -928,7 +919,7 @@ index 9b3aaabfa0a..f6a5986184d 100644
  #ifdef OBJ_ELF
  	  /* These can appear with @l etc. in data.  */
  	case BFD_RELOC_LO16:
-@@ -7689,7 +7793,7 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
+@@ -7689,7 +7791,7 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
  	  && strcmp (S_GET_NAME (fixP->fx_addsy), ".TOC.") == 0)
  	symbol_get_bfdsym (fixP->fx_addsy)->flags |= BSF_KEEP;
      }
@@ -937,7 +928,7 @@ index 9b3aaabfa0a..f6a5986184d 100644
    if (fixP->fx_r_type == BFD_RELOC_PPC_TOC16
        || fixP->fx_r_type == BFD_RELOC_PPC_TOC16_HI
        || fixP->fx_r_type == BFD_RELOC_PPC_TOC16_LO)
-@@ -7719,6 +7823,8 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
+@@ -7719,6 +7821,8 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg)
  			  - fieldval);
    else
      fixP->fx_addnumber = 0;
@@ -947,10 +938,10 @@ index 9b3aaabfa0a..f6a5986184d 100644
  }
  
 diff --git a/gas/config/tc-ppc.h b/gas/config/tc-ppc.h
-index 97e2f4ed197..152e7ba594a 100644
+index 97e2f4ed197..9d68189065a 100644
 --- a/gas/config/tc-ppc.h
 +++ b/gas/config/tc-ppc.h
-@@ -30,8 +30,9 @@ struct fix;
+@@ -30,11 +30,21 @@ struct fix;
  #define TARGET_BYTES_BIG_ENDIAN 1
  #endif
  
@@ -962,7 +953,19 @@ index 97e2f4ed197..152e7ba594a 100644
  #define OBJ_XCOFF
  #endif
  
-@@ -262,6 +263,8 @@ extern void ppc_md_end (void);
++/* PPC PE targets do not need '@' in symbol names.  Override the
++   te-pe.h LEX_AT setting so that '@' terminates symbol names,
++   allowing @h / @l relocation suffixes to work without quoting.
++   MSVC-mangled names containing '@' must be quoted instead.  */
++#if defined (TE_PE) && defined (LEX_AT)
++#undef LEX_AT
++#define LEX_AT 0
++#endif
++
+ /* The target BFD architecture.  */
+ #define TARGET_ARCH (ppc_arch ())
+ #define TARGET_MACH (ppc_mach ())
+@@ -262,6 +272,8 @@ extern void ppc_md_end (void);
  #if defined (OBJ_ELF) || defined (OBJ_XCOFF)
  #define TC_FORCE_RELOCATION(FIX) ppc_force_relocation (FIX)
  extern int ppc_force_relocation (struct fix *);
